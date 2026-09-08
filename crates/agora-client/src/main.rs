@@ -131,11 +131,29 @@ enum AppTab {
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShellMode {
     Tray,
     OverlayPassive,
     OverlayInteractive,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlayWindowCommand {
+    None,
+    ApplyPassive(game::GameWindow),
+    ApplyInteractive(game::GameWindow),
+    HideToTray,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GameWatchStep {
+    detected: Option<game::GameWindow>,
+    shell_mode: ShellMode,
+    overlay_interactive: bool,
+    command: OverlayWindowCommand,
 }
 
 #[cfg(windows)]
@@ -360,50 +378,24 @@ async fn watch_game_window(
 ) {
     loop {
         let raw_detected = game::detect_aom_window();
-        let detected = raw_detected
-            .filter(|window| !window.minimized && window.width > 0 && window.height > 0);
         let previous = *game_window.read();
-        game_window.set(detected);
         let desktop_foreground = desktop_is_foreground(&desktop);
+        let step = game_watch_step(
+            *shell_mode.read(),
+            *overlay_interactive.read(),
+            previous,
+            raw_detected,
+            desktop_foreground,
+        );
 
-        match detected {
-            Some(bounds) => {
-                if *overlay_interactive.read() {
-                    if desktop_foreground || bounds.foreground {
-                        if *shell_mode.read() != ShellMode::OverlayInteractive {
-                            shell_mode.set(ShellMode::OverlayInteractive);
-                            apply_interactive_overlay_window(&desktop, bounds);
-                        } else if overlay_bounds_changed(previous, bounds) {
-                            apply_interactive_overlay_window(&desktop, bounds);
-                        }
-                    } else {
-                        if *shell_mode.read() != ShellMode::Tray {
-                            shell_mode.set(ShellMode::Tray);
-                        }
-                        hide_to_tray(&desktop);
-                    }
-                } else if bounds.foreground {
-                    if *shell_mode.read() != ShellMode::OverlayPassive {
-                        shell_mode.set(ShellMode::OverlayPassive);
-                        apply_passive_overlay_window(&desktop, bounds);
-                    } else if overlay_bounds_changed(previous, bounds) {
-                        apply_passive_overlay_window(&desktop, bounds);
-                    }
-                } else {
-                    if *shell_mode.read() != ShellMode::Tray {
-                        shell_mode.set(ShellMode::Tray);
-                    }
-                    hide_to_tray(&desktop);
-                }
-            }
-            None => {
-                overlay_interactive.set(false);
-                if *shell_mode.read() != ShellMode::Tray {
-                    shell_mode.set(ShellMode::Tray);
-                }
-                hide_to_tray(&desktop);
-            }
+        game_window.set(step.detected);
+        if *overlay_interactive.read() != step.overlay_interactive {
+            overlay_interactive.set(step.overlay_interactive);
         }
+        if *shell_mode.read() != step.shell_mode {
+            shell_mode.set(step.shell_mode);
+        }
+        apply_overlay_window_command(&desktop, step.command);
 
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(GAME_WATCH_INTERVAL_MS)) => {}
@@ -413,6 +405,90 @@ async fn watch_game_window(
                 }
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn game_watch_step(
+    shell_mode: ShellMode,
+    overlay_interactive: bool,
+    previous: Option<game::GameWindow>,
+    raw_detected: Option<game::GameWindow>,
+    desktop_foreground: bool,
+) -> GameWatchStep {
+    let detected = visible_detected_game_window(raw_detected);
+    match detected {
+        Some(bounds) if overlay_interactive && (desktop_foreground || bounds.foreground) => {
+            GameWatchStep {
+                detected,
+                shell_mode: ShellMode::OverlayInteractive,
+                overlay_interactive: true,
+                command: if shell_mode != ShellMode::OverlayInteractive
+                    || overlay_bounds_changed(previous, bounds)
+                {
+                    OverlayWindowCommand::ApplyInteractive(bounds)
+                } else {
+                    OverlayWindowCommand::None
+                },
+            }
+        }
+        Some(_) if overlay_interactive => GameWatchStep {
+            detected,
+            shell_mode: ShellMode::Tray,
+            overlay_interactive: true,
+            command: OverlayWindowCommand::HideToTray,
+        },
+        Some(bounds) if bounds.foreground => GameWatchStep {
+            detected,
+            shell_mode: ShellMode::OverlayPassive,
+            overlay_interactive: false,
+            command: if shell_mode != ShellMode::OverlayPassive
+                || overlay_bounds_changed(previous, bounds)
+            {
+                OverlayWindowCommand::ApplyPassive(bounds)
+            } else {
+                OverlayWindowCommand::None
+            },
+        },
+        Some(_) => GameWatchStep {
+            detected,
+            shell_mode: ShellMode::Tray,
+            overlay_interactive: false,
+            command: OverlayWindowCommand::HideToTray,
+        },
+        None => GameWatchStep {
+            detected: None,
+            shell_mode: ShellMode::Tray,
+            overlay_interactive: false,
+            command: OverlayWindowCommand::HideToTray,
+        },
+    }
+}
+
+#[cfg(windows)]
+fn visible_detected_game_window(
+    raw_detected: Option<game::GameWindow>,
+) -> Option<game::GameWindow> {
+    raw_detected.filter(|window| !window.minimized && window.width > 0 && window.height > 0)
+}
+
+#[cfg(windows)]
+fn focused_visible_game_window(raw_detected: Option<game::GameWindow>) -> Option<game::GameWindow> {
+    visible_detected_game_window(raw_detected).filter(|window| window.foreground)
+}
+
+#[cfg(windows)]
+fn apply_overlay_window_command(
+    desktop: &dioxus::desktop::DesktopContext,
+    command: OverlayWindowCommand,
+) {
+    match command {
+        OverlayWindowCommand::None => {}
+        OverlayWindowCommand::ApplyPassive(bounds) => apply_passive_overlay_window(desktop, bounds),
+        OverlayWindowCommand::ApplyInteractive(bounds) => {
+            apply_interactive_overlay_window(desktop, bounds);
+        }
+        OverlayWindowCommand::HideToTray => hide_to_tray(desktop),
     }
 }
 
@@ -502,10 +578,11 @@ fn open_typing_mode_if_game_focused(
     mut game_window: Signal<Option<game::GameWindow>>,
     mut overlay_interactive: Signal<bool>,
 ) {
-    let detected = visible_aom_window();
+    let raw_detected = game::detect_aom_window();
+    let detected = visible_detected_game_window(raw_detected);
     game_window.set(detected);
 
-    if let Some(bounds) = detected.filter(|bounds| bounds.foreground) {
+    if let Some(bounds) = focused_visible_game_window(raw_detected) {
         overlay_interactive.set(true);
         active_tab.set(AppTab::Global);
         shell_mode.set(ShellMode::OverlayInteractive);
@@ -515,8 +592,7 @@ fn open_typing_mode_if_game_focused(
 
 #[cfg(windows)]
 fn visible_aom_window() -> Option<game::GameWindow> {
-    game::detect_aom_window()
-        .filter(|window| !window.minimized && window.width > 0 && window.height > 0)
+    visible_detected_game_window(game::detect_aom_window())
 }
 
 #[cfg(windows)]
@@ -745,6 +821,235 @@ fn overlay_position(bounds: game::GameWindow, width: i32, height: i32) -> (i32, 
         bounds.y + OVERLAY_MARGIN
     };
     (x, y)
+}
+
+#[cfg(all(test, windows))]
+mod overlay_state_tests {
+    use super::*;
+
+    fn game_window(foreground: bool) -> game::GameWindow {
+        game::GameWindow {
+            pid: 42,
+            x: -2560,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            foreground,
+            minimized: false,
+        }
+    }
+
+    fn hidden_step(detected: Option<game::GameWindow>, overlay_interactive: bool) -> GameWatchStep {
+        GameWatchStep {
+            detected,
+            shell_mode: ShellMode::Tray,
+            overlay_interactive,
+            command: OverlayWindowCommand::HideToTray,
+        }
+    }
+
+    #[test]
+    fn game_absence_hides_to_tray_and_clears_interaction_mode() {
+        let step = game_watch_step(
+            ShellMode::OverlayInteractive,
+            true,
+            Some(game_window(true)),
+            None,
+            true,
+        );
+
+        assert_eq!(step, hidden_step(None, false));
+    }
+
+    #[test]
+    fn minimized_or_invalid_game_bounds_are_treated_as_absent() {
+        let visible = game_window(true);
+        let minimized = game::GameWindow {
+            minimized: true,
+            ..visible
+        };
+        let zero_width = game::GameWindow {
+            width: 0,
+            ..visible
+        };
+        let zero_height = game::GameWindow {
+            height: 0,
+            ..visible
+        };
+
+        for raw_detected in [Some(minimized), Some(zero_width), Some(zero_height)] {
+            let step = game_watch_step(
+                ShellMode::OverlayPassive,
+                false,
+                Some(visible),
+                raw_detected,
+                false,
+            );
+
+            assert_eq!(step, hidden_step(None, false));
+        }
+    }
+
+    #[test]
+    fn visible_but_unfocused_game_hides_to_tray() {
+        let unfocused = game_window(false);
+
+        let step = game_watch_step(
+            ShellMode::OverlayPassive,
+            false,
+            Some(unfocused),
+            Some(unfocused),
+            false,
+        );
+
+        assert_eq!(step, hidden_step(Some(unfocused), false));
+    }
+
+    #[test]
+    fn focused_game_opens_passive_overlay_when_not_typing() {
+        let focused = game_window(true);
+
+        let step = game_watch_step(ShellMode::Tray, false, None, Some(focused), false);
+
+        assert_eq!(
+            step,
+            GameWatchStep {
+                detected: Some(focused),
+                shell_mode: ShellMode::OverlayPassive,
+                overlay_interactive: false,
+                command: OverlayWindowCommand::ApplyPassive(focused),
+            }
+        );
+    }
+
+    #[test]
+    fn unchanged_focused_game_keeps_existing_passive_overlay() {
+        let focused = game_window(true);
+
+        let step = game_watch_step(
+            ShellMode::OverlayPassive,
+            false,
+            Some(focused),
+            Some(focused),
+            false,
+        );
+
+        assert_eq!(
+            step,
+            GameWatchStep {
+                detected: Some(focused),
+                shell_mode: ShellMode::OverlayPassive,
+                overlay_interactive: false,
+                command: OverlayWindowCommand::None,
+            }
+        );
+    }
+
+    #[test]
+    fn focused_game_bounds_change_reapplies_passive_overlay() {
+        let previous = game_window(true);
+        let resized = game::GameWindow {
+            width: 1920,
+            height: 1080,
+            ..previous
+        };
+
+        let step = game_watch_step(
+            ShellMode::OverlayPassive,
+            false,
+            Some(previous),
+            Some(resized),
+            false,
+        );
+
+        assert_eq!(
+            step,
+            GameWatchStep {
+                detected: Some(resized),
+                shell_mode: ShellMode::OverlayPassive,
+                overlay_interactive: false,
+                command: OverlayWindowCommand::ApplyPassive(resized),
+            }
+        );
+    }
+
+    #[test]
+    fn typing_mode_opens_interactive_overlay_when_game_is_focused() {
+        let focused = game_window(true);
+
+        let step = game_watch_step(ShellMode::Tray, true, None, Some(focused), false);
+
+        assert_eq!(
+            step,
+            GameWatchStep {
+                detected: Some(focused),
+                shell_mode: ShellMode::OverlayInteractive,
+                overlay_interactive: true,
+                command: OverlayWindowCommand::ApplyInteractive(focused),
+            }
+        );
+    }
+
+    #[test]
+    fn typing_mode_stays_visible_when_overlay_itself_has_focus() {
+        let unfocused_game = game_window(false);
+
+        let step = game_watch_step(ShellMode::Tray, true, None, Some(unfocused_game), true);
+
+        assert_eq!(
+            step,
+            GameWatchStep {
+                detected: Some(unfocused_game),
+                shell_mode: ShellMode::OverlayInteractive,
+                overlay_interactive: true,
+                command: OverlayWindowCommand::ApplyInteractive(unfocused_game),
+            }
+        );
+    }
+
+    #[test]
+    fn typing_mode_hides_when_neither_game_nor_overlay_has_focus() {
+        let unfocused_game = game_window(false);
+
+        let step = game_watch_step(
+            ShellMode::OverlayInteractive,
+            true,
+            Some(unfocused_game),
+            Some(unfocused_game),
+            false,
+        );
+
+        assert_eq!(step, hidden_step(Some(unfocused_game), true));
+    }
+
+    #[test]
+    fn hotkey_open_requires_a_focused_visible_game_window() {
+        let focused = game_window(true);
+        let unfocused = game_window(false);
+        let minimized = game::GameWindow {
+            minimized: true,
+            ..focused
+        };
+        let zero_width = game::GameWindow {
+            width: 0,
+            ..focused
+        };
+        let zero_height = game::GameWindow {
+            height: 0,
+            ..focused
+        };
+
+        assert_eq!(focused_visible_game_window(Some(focused)), Some(focused));
+        for raw_detected in [
+            None,
+            Some(unfocused),
+            Some(minimized),
+            Some(zero_width),
+            Some(zero_height),
+        ] {
+            assert_eq!(focused_visible_game_window(raw_detected), None);
+        }
+    }
 }
 
 #[cfg(windows)]
