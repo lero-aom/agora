@@ -2,7 +2,13 @@ use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
 use agora_common::{HealthResponse, VersionResponse, PROTOCOL_VERSION};
 use anyhow::{bail, Context, Result};
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    http::{Request, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -133,7 +139,16 @@ fn app(state: AppState) -> Router {
         .merge(auth::router())
         .merge(chat::router())
         .merge(relationships::router())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    version = ?request.version(),
+                )
+            }),
+        )
         .with_state(state)
 }
 

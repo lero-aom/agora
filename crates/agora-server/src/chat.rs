@@ -351,15 +351,17 @@ async fn insert_global_message(
         return Err(sqlx::Error::RowNotFound);
     };
 
+    let created_at = row.try_get::<String, _>("created_at")?;
     Ok(ChatMessage {
         id: row.try_get("id")?,
         author: user.clone(),
         body: row.try_get("body")?,
-        created_at: row.try_get("created_at")?,
+        created_at: display_chat_timestamp(&created_at),
     })
 }
 
 fn row_to_chat_message(row: &PgRow) -> Result<ChatMessage, sqlx::Error> {
+    let created_at = row.try_get::<String, _>("created_at")?;
     Ok(ChatMessage {
         id: row.try_get("id")?,
         author: UserSummary {
@@ -368,8 +370,30 @@ fn row_to_chat_message(row: &PgRow) -> Result<ChatMessage, sqlx::Error> {
             avatar_url: row.try_get("author_avatar_url")?,
         },
         body: row.try_get("body")?,
-        created_at: row.try_get("created_at")?,
+        created_at: display_chat_timestamp(&created_at),
     })
+}
+
+fn display_chat_timestamp(value: &str) -> String {
+    let value = value.trim();
+    if has_timestamp_prefix(value) {
+        value[..19].replace('T', " ")
+    } else {
+        value.to_string()
+    }
+}
+
+fn has_timestamp_prefix(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 19
+        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+            .into_iter()
+            .all(|index| bytes[index].is_ascii_digit())
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && matches!(bytes[10], b' ' | b'T')
+        && bytes[13] == b':'
+        && bytes[16] == b':'
 }
 
 fn normalize_message_body(body: &str) -> Result<String, &'static str> {
@@ -420,6 +444,23 @@ mod tests {
         let body = "x".repeat(MAX_MESSAGE_LEN + 1);
 
         assert_eq!(normalize_message_body(&body), Err("Message is too long"));
+    }
+
+    #[test]
+    fn formats_display_chat_timestamps_without_fraction_or_timezone() {
+        assert_eq!(
+            display_chat_timestamp("2026-09-08 18:15:09.505579+00"),
+            "2026-09-08 18:15:09"
+        );
+        assert_eq!(
+            display_chat_timestamp("2026-09-08T18:15:09.505579Z"),
+            "2026-09-08 18:15:09"
+        );
+    }
+
+    #[test]
+    fn leaves_unexpected_display_chat_timestamps_unchanged() {
+        assert_eq!(display_chat_timestamp("not a timestamp"), "not a timestamp");
     }
 
     #[test]

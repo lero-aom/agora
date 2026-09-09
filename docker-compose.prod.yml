@@ -1,0 +1,54 @@
+services:
+  proxy:
+    image: caddy:2
+    environment:
+      AGORA_SITE_ADDRESS: ${AGORA_SITE_ADDRESS:?set AGORA_SITE_ADDRESS}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  server:
+    image: ${AGORA_SERVER_IMAGE:-ghcr.io/lero-aom/agora-server:latest}
+    environment:
+      AGORA_BIND_ADDR: 0.0.0.0:8080
+      AGORA_PUBLIC_URL: ${AGORA_PUBLIC_URL:?set AGORA_PUBLIC_URL}
+      AGORA_ENABLE_DEV_LOGIN: ${AGORA_ENABLE_DEV_LOGIN:?set AGORA_ENABLE_DEV_LOGIN}
+      AGORA_TRUST_PROXY_HEADERS: ${AGORA_TRUST_PROXY_HEADERS:-false}
+      AGORA_MIN_CLIENT_VERSION: ${AGORA_MIN_CLIENT_VERSION:-0.1.0}
+      AGORA_SESSION_SECRET: ${AGORA_SESSION_SECRET:?set AGORA_SESSION_SECRET}
+      AGORA_RUN_MIGRATIONS: "true"
+      DATABASE_URL: postgres://agora:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/agora
+      STEAM_WEB_API_KEY: ${STEAM_WEB_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: agora
+      POSTGRES_USER: agora
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agora -d agora"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
+  postgres_data:

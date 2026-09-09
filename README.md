@@ -62,6 +62,33 @@ Prerequisites:
 VPS with Docker and Docker Compose
 Domain DNS A/AAAA record pointing to the VPS
 Inbound ports 80 and 443 open
+Outbound HTTPS from Docker containers working
+Published server image, default: ghcr.io/lero-aom/agora-server:latest
+```
+
+Build and publish the Linux server image from a local machine:
+
+```powershell
+docker login ghcr.io -u <github-username>
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\publish-server-image.ps1
+```
+
+The publish script builds `linux/amd64` and pushes both `0.1.0` and `latest` tags to `ghcr.io/lero-aom/agora-server` by default. The VPS should pull this image; it should not build Rust release artifacts itself.
+
+Prepare the VPS deployment directory:
+
+```bash
+sudo mkdir -p /opt/agora
+sudo chown "$USER:$USER" /opt/agora
+cd /opt/agora
+```
+
+Copy these files to `/opt/agora` on the VPS:
+
+```text
+docker-compose.prod.yml as docker-compose.yml
+Caddyfile
+.env
 ```
 
 Create production env:
@@ -75,25 +102,31 @@ Edit `.env` for production:
 ```text
 POSTGRES_PASSWORD=<long random password>
 AGORA_SESSION_SECRET=<long random secret>
-AGORA_PUBLIC_URL=https://your-domain.example
+AGORA_PUBLIC_URL=https://chat.aomagora.com
 AGORA_ENABLE_DEV_LOGIN=false
-AGORA_TRUST_PROXY_HEADERS=false
-AGORA_SITE_ADDRESS=your-domain.example
+AGORA_TRUST_PROXY_HEADERS=true
+AGORA_SITE_ADDRESS=chat.aomagora.com
 AGORA_MIN_CLIENT_VERSION=0.1.0
-STEAM_WEB_API_KEY=<optional Steam Web API key for avatars/names>
+AGORA_SERVER_IMAGE=ghcr.io/lero-aom/agora-server:latest
+STEAM_WEB_API_KEY=
 ```
+
+Use URL-safe random values for `POSTGRES_PASSWORD` and `AGORA_SESSION_SECRET`, for example `openssl rand -hex 32`. Leave `STEAM_WEB_API_KEY` empty for the first deployment; Steam OpenID login does not require it.
 
 Start the stack:
 
-```powershell
-docker compose up -d --build
+```bash
+cd /opt/agora
+sudo docker compose pull
+sudo docker compose up -d
 ```
 
 Verify deployment:
 
-```powershell
-Invoke-RestMethod https://your-domain.example/health
-Invoke-RestMethod https://your-domain.example/version
+```bash
+sudo docker compose ps
+curl https://chat.aomagora.com/health
+curl https://chat.aomagora.com/version
 ```
 
 Production checks before inviting testers:
@@ -102,11 +135,14 @@ Production checks before inviting testers:
 AGORA_ENABLE_DEV_LOGIN=false
 AGORA_PUBLIC_URL uses https:// and the public domain
 AGORA_SITE_ADDRESS is the public domain, not :80
+AGORA_TRUST_PROXY_HEADERS=true when the server is only reachable through Caddy
 AGORA_SESSION_SECRET is at least 32 random characters and not a placeholder
 Caddy has issued a valid TLS certificate
 Steam OpenID login completes on the public domain
 PostgreSQL volume is backed up or snapshot by the VPS provider
 ```
+
+If the VPS uses nftables or another firewall, keep public inbound access limited to ports 22, 80, and 443, but allow Docker bridge forwarding so containers can reach Let's Encrypt and Steam over outbound HTTPS.
 
 ## Backup And Restore
 
@@ -134,7 +170,7 @@ For a live restore, stop the server first, recreate the `agora` database, restor
 cargo run -p agora-client
 ```
 
-The client defaults to `http://localhost`, which matches the local Docker Compose proxy. If you run `agora-server` manually on its default `127.0.0.1:8080` without Caddy, set `$env:AGORA_SERVER_URL="http://localhost:8080"` before launching the client.
+Local debug builds default to `http://localhost`, which matches the local Docker Compose proxy. Release builds can bake in a different default with `AGORA_DEFAULT_SERVER_URL`; the release script defaults to `https://chat.aomagora.com`. At runtime, `AGORA_SERVER_URL` overrides either default. If you run `agora-server` manually on its default `127.0.0.1:8080` without Caddy, set `$env:AGORA_SERVER_URL="http://localhost:8080"` before launching the client.
 
 When pointed at `localhost`, the client uses a local-only dev login because Steam rejects `localhost` as an OpenID realm during final confirmation. Against a real public domain, the same client uses Steam OpenID, then stores only the Agora refresh token in Windows Credential Manager and refreshes the session on startup and before access-token expiry. After sign-in, the Global chat tab connects automatically, reconnects after transient drops, supports Enter-to-send, and the Friends and Block / Report tabs can search users and call the relationship APIs.
 
@@ -183,10 +219,16 @@ cargo test --workspace
 
 ## Release Build
 
-Build checked release binaries and package them into `dist\agora-<version>-windows-x64.zip`:
+Build checked release binaries and package them into `dist\agora-<version>-windows-x64.zip`. By default, the packaged Windows client points at `https://chat.aomagora.com`:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1
+```
+
+To build a package for another server URL:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1 -ServerUrl https://your-domain.example
 ```
 
 If GNU Make is available, the same workflow is exposed as:
@@ -195,7 +237,7 @@ If GNU Make is available, the same workflow is exposed as:
 make release
 ```
 
-The release script runs formatting, clippy, tests, `cargo build --locked --release -p agora-server`, and `cargo build --locked --release -p agora-client`. Use `-SkipChecks` only when checks have already run in the same tree.
+The release script runs formatting, clippy, tests, `cargo build --locked --release -p agora-server`, and `cargo build --locked --release -p agora-client`. Use `-SkipChecks` only when checks have already run in the same tree. The same release executable can still be pointed elsewhere with `AGORA_SERVER_URL` for local debugging.
 
 ## Docker Troubleshooting
 

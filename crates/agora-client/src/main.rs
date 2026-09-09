@@ -61,9 +61,10 @@ use agora_common::{
     ApiError, AuthSession, BlockListResponse, BlockUserRequest, BlockUserResponse, ChatMessage,
     ClientEvent, CreateReportRequest, CreateReportResponse, DevLoginRequest, DevLoginResponse,
     FriendListResponse, FriendRequest, FriendshipResponse, FriendshipStatus, FriendshipSummary,
-    LogoutRequest, PresenceCounts, RefreshRequest, RefreshResponse, RemoveFriendResponse,
-    ServerEvent, SteamLoginPollRequest, SteamLoginPollResponse, SteamLoginStartResponse,
-    SteamLoginStatus, UnblockUserResponse, UserSearchResponse, UserSummary, MAX_MESSAGE_LEN,
+    LogoutRequest, MessageKind, PresenceCounts, RefreshRequest, RefreshResponse,
+    RemoveFriendResponse, ServerEvent, SteamLoginPollRequest, SteamLoginPollResponse,
+    SteamLoginStartResponse, SteamLoginStatus, UnblockUserResponse, UserSearchResponse,
+    UserSummary, MAX_MESSAGE_LEN,
 };
 #[cfg(windows)]
 use dioxus::desktop::tao::platform::windows::WindowExtWindows;
@@ -121,6 +122,10 @@ const OVERLAY_INTERACTIVE_HEIGHT: i32 = 560;
 const OVERLAY_MARGIN: i32 = 24;
 #[cfg(windows)]
 const OVERLAY_PASSIVE_TOP_OFFSET: i32 = 22;
+#[cfg(windows)]
+const TASKBAR_ANCHOR_POSITION: i32 = -32_000;
+#[cfg(windows)]
+const TASKBAR_ANCHOR_SIZE: i32 = 1;
 
 #[cfg(windows)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -157,6 +162,24 @@ struct GameWatchStep {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReportDraft {
+    target: UserSummary,
+    message_id: Option<uuid::Uuid>,
+    message_kind: Option<MessageKind>,
+    message_preview: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct FriendSections {
+    accepted: Vec<FriendshipSummary>,
+    incoming: Vec<FriendshipSummary>,
+    outgoing: Vec<FriendshipSummary>,
+    inactive: Vec<FriendshipSummary>,
+}
+
+#[cfg(windows)]
 #[allow(non_snake_case)]
 fn App() -> Element {
     let desktop = dioxus::desktop::use_window();
@@ -190,6 +213,7 @@ fn App() -> Element {
     let block_status = use_signal(|| "Sign in to manage blocks".to_string());
     let report_reason = use_signal(String::new);
     let report_details = use_signal(String::new);
+    let report_draft = use_signal(|| None::<ReportDraft>);
     let report_status = use_signal(|| "Search for a user to report".to_string());
 
     use_hook(move || {
@@ -238,6 +262,7 @@ fn App() -> Element {
                                 friends_status,
                                 blocked_users,
                                 block_status,
+                                report_draft,
                             );
                             auth_action_pending.set(false);
                         }
@@ -261,6 +286,7 @@ fn App() -> Element {
                                 block_status,
                                 report_reason,
                                 report_details,
+                                report_draft,
                                 report_status,
                             );
                             login_status.set(format!("Saved session expired: {error}"));
@@ -360,6 +386,7 @@ fn App() -> Element {
                 block_status,
                 report_reason,
                 report_details,
+                report_draft,
                 report_status,
             )}
         } else {
@@ -436,7 +463,7 @@ fn game_watch_step(
             detected,
             shell_mode: ShellMode::Tray,
             overlay_interactive: true,
-            command: OverlayWindowCommand::HideToTray,
+            command: hide_to_tray_command(shell_mode),
         },
         Some(bounds) if bounds.foreground => GameWatchStep {
             detected,
@@ -454,14 +481,23 @@ fn game_watch_step(
             detected,
             shell_mode: ShellMode::Tray,
             overlay_interactive: false,
-            command: OverlayWindowCommand::HideToTray,
+            command: hide_to_tray_command(shell_mode),
         },
         None => GameWatchStep {
             detected: None,
             shell_mode: ShellMode::Tray,
             overlay_interactive: false,
-            command: OverlayWindowCommand::HideToTray,
+            command: hide_to_tray_command(shell_mode),
         },
+    }
+}
+
+#[cfg(windows)]
+fn hide_to_tray_command(shell_mode: ShellMode) -> OverlayWindowCommand {
+    if shell_mode == ShellMode::Tray {
+        OverlayWindowCommand::None
+    } else {
+        OverlayWindowCommand::HideToTray
     }
 }
 
@@ -695,10 +731,15 @@ fn apply_interactive_overlay_window(
 
 #[cfg(windows)]
 fn hide_to_tray(desktop: &dioxus::desktop::DesktopContext) {
-    let _ = desktop.set_ignore_cursor_events(false);
     desktop.set_visible(false);
+    let _ = desktop.set_ignore_cursor_events(true);
+    desktop.set_decorations(false);
+    desktop.set_resizable(false);
     desktop.set_always_on_top(false);
+    set_taskbar_anchor_background(desktop);
+    set_taskbar_anchor_rect(desktop);
     apply_tray_native_window_style(desktop);
+    desktop.set_visible(true);
 }
 
 #[cfg(windows)]
@@ -707,14 +748,19 @@ fn set_overlay_background(desktop: &dioxus::desktop::DesktopContext) {
 }
 
 #[cfg(windows)]
+fn set_taskbar_anchor_background(desktop: &dioxus::desktop::DesktopContext) {
+    desktop.window.set_background_color(Some((7, 9, 9, 0)));
+}
+
+#[cfg(windows)]
 fn apply_passive_native_window_style(desktop: &dioxus::desktop::DesktopContext) {
     desktop.window.set_enable(false);
     set_overlay_ex_style(
         desktop,
-        WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
-        WS_EX_APPWINDOW,
+        WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_APPWINDOW,
+        WS_EX_TOOLWINDOW,
     );
-    let _ = desktop.window.set_skip_taskbar(true);
+    let _ = desktop.window.set_skip_taskbar(false);
 }
 
 #[cfg(windows)]
@@ -722,10 +768,10 @@ fn apply_typing_native_window_style(desktop: &dioxus::desktop::DesktopContext) {
     desktop.window.set_enable(true);
     set_overlay_ex_style(
         desktop,
-        WS_EX_TOOLWINDOW,
-        WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_APPWINDOW,
+        WS_EX_APPWINDOW,
+        WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
     );
-    let _ = desktop.window.set_skip_taskbar(true);
+    let _ = desktop.window.set_skip_taskbar(false);
 }
 
 #[cfg(windows)]
@@ -733,10 +779,10 @@ fn apply_tray_native_window_style(desktop: &dioxus::desktop::DesktopContext) {
     desktop.window.set_enable(true);
     set_overlay_ex_style(
         desktop,
-        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-        WS_EX_APPWINDOW | WS_EX_TRANSPARENT,
+        WS_EX_NOACTIVATE | WS_EX_APPWINDOW,
+        WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
     );
-    let _ = desktop.window.set_skip_taskbar(true);
+    let _ = desktop.window.set_skip_taskbar(false);
 }
 
 #[cfg(windows)]
@@ -795,6 +841,31 @@ fn set_window_rect(
             y,
             width.max(1),
             height.max(1),
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn set_taskbar_anchor_rect(desktop: &dioxus::desktop::DesktopContext) {
+    desktop.set_inner_size(dioxus::desktop::tao::dpi::PhysicalSize::new(
+        TASKBAR_ANCHOR_SIZE as u32,
+        TASKBAR_ANCHOR_SIZE as u32,
+    ));
+    desktop.set_outer_position(dioxus::desktop::tao::dpi::PhysicalPosition::new(
+        TASKBAR_ANCHOR_POSITION,
+        TASKBAR_ANCHOR_POSITION,
+    ));
+
+    let hwnd = desktop.window.hwnd() as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            TASKBAR_ANCHOR_POSITION,
+            TASKBAR_ANCHOR_POSITION,
+            TASKBAR_ANCHOR_SIZE,
+            TASKBAR_ANCHOR_SIZE,
             SWP_NOACTIVATE | SWP_NOZORDER,
         );
     }
@@ -903,6 +974,44 @@ mod overlay_state_tests {
         );
 
         assert_eq!(step, hidden_step(Some(unfocused), false));
+    }
+
+    #[test]
+    fn repeated_unfocused_game_does_not_reapply_tray_hide() {
+        let unfocused = game_window(false);
+
+        let step = game_watch_step(
+            ShellMode::Tray,
+            false,
+            Some(unfocused),
+            Some(unfocused),
+            false,
+        );
+
+        assert_eq!(
+            step,
+            GameWatchStep {
+                detected: Some(unfocused),
+                shell_mode: ShellMode::Tray,
+                overlay_interactive: false,
+                command: OverlayWindowCommand::None,
+            }
+        );
+    }
+
+    #[test]
+    fn repeated_game_absence_does_not_reapply_tray_hide() {
+        let step = game_watch_step(ShellMode::Tray, false, None, None, false);
+
+        assert_eq!(
+            step,
+            GameWatchStep {
+                detected: None,
+                shell_mode: ShellMode::Tray,
+                overlay_interactive: false,
+                command: OverlayWindowCommand::None,
+            }
+        );
     }
 
     #[test]
@@ -1023,6 +1132,29 @@ mod overlay_state_tests {
     }
 
     #[test]
+    fn repeated_hidden_typing_mode_does_not_reapply_tray_hide() {
+        let unfocused_game = game_window(false);
+
+        let step = game_watch_step(
+            ShellMode::Tray,
+            true,
+            Some(unfocused_game),
+            Some(unfocused_game),
+            false,
+        );
+
+        assert_eq!(
+            step,
+            GameWatchStep {
+                detected: Some(unfocused_game),
+                shell_mode: ShellMode::Tray,
+                overlay_interactive: true,
+                command: OverlayWindowCommand::None,
+            }
+        );
+    }
+
+    #[test]
     fn hotkey_open_requires_a_focused_visible_game_window() {
         let focused = game_window(true);
         let unfocused = game_window(false);
@@ -1090,6 +1222,7 @@ fn start_session_refresh_loop(
     mut friends_status: Signal<String>,
     mut blocked_users: Signal<Vec<UserSummary>>,
     mut block_status: Signal<String>,
+    mut report_draft: Signal<Option<ReportDraft>>,
 ) {
     spawn(async move {
         let mut session = session;
@@ -1165,6 +1298,7 @@ fn start_session_refresh_loop(
                     friends_status.set("Sign in to load friends".to_string());
                     blocked_users.set(Vec::new());
                     block_status.set("Sign in to manage blocks".to_string());
+                    report_draft.set(None);
                     login_status.set(format!("Session expired: {error}"));
                     return;
                 }
@@ -1222,6 +1356,7 @@ fn sign_in_session(
     friends_status: Signal<String>,
     blocked_users: Signal<Vec<UserSummary>>,
     block_status: Signal<String>,
+    report_draft: Signal<Option<ReportDraft>>,
 ) {
     if *auth_action_pending.read() {
         return;
@@ -1273,6 +1408,7 @@ fn sign_in_session(
                     friends_status,
                     blocked_users,
                     block_status,
+                    report_draft,
                 );
             }
             Err(error) => {
@@ -1306,6 +1442,7 @@ fn sign_out_session(
     block_status: Signal<String>,
     report_reason: Signal<String>,
     report_details: Signal<String>,
+    report_draft: Signal<Option<ReportDraft>>,
     report_status: Signal<String>,
 ) {
     if *auth_action_pending.read() {
@@ -1330,6 +1467,7 @@ fn sign_out_session(
             block_status,
             report_reason,
             report_details,
+            report_draft,
             report_status,
         );
 
@@ -1364,6 +1502,7 @@ fn reset_relationship_state(
     mut block_status: Signal<String>,
     mut report_reason: Signal<String>,
     mut report_details: Signal<String>,
+    mut report_draft: Signal<Option<ReportDraft>>,
     mut report_status: Signal<String>,
 ) {
     friendships.set(Vec::new());
@@ -1376,6 +1515,7 @@ fn reset_relationship_state(
     block_status.set("Sign in to manage blocks".to_string());
     report_reason.set(String::new());
     report_details.set(String::new());
+    report_draft.set(None);
     report_status.set("Search for a user to report".to_string());
 }
 
@@ -1717,13 +1857,71 @@ fn unblock_user_action(
 }
 
 #[cfg(windows)]
-fn report_user_action(
+fn user_report_draft(user: UserSummary) -> ReportDraft {
+    ReportDraft {
+        target: user,
+        message_id: None,
+        message_kind: None,
+        message_preview: None,
+    }
+}
+
+#[cfg(windows)]
+fn global_message_report_draft(message: &ChatMessage) -> ReportDraft {
+    ReportDraft {
+        target: message.author.clone(),
+        message_id: Some(message.id),
+        message_kind: Some(MessageKind::Global),
+        message_preview: Some(message.body.clone()),
+    }
+}
+
+#[cfg(windows)]
+fn report_draft_status(draft: &ReportDraft) -> String {
+    if draft.message_id.is_some() {
+        format!(
+            "Selected message from {}. Enter a reason, then submit.",
+            draft.target.display_name
+        )
+    } else {
+        format!(
+            "Selected {}. Enter a reason, then submit.",
+            draft.target.display_name
+        )
+    }
+}
+
+#[cfg(windows)]
+fn report_draft_kind_label(draft: &ReportDraft) -> &'static str {
+    match draft.message_kind {
+        Some(MessageKind::Global) => "Global message",
+        Some(MessageKind::Dm) => "Direct message",
+        None => "User",
+    }
+}
+
+#[cfg(windows)]
+fn report_preview_text(value: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 140;
+    let mut preview = value.chars().take(MAX_PREVIEW_CHARS).collect::<String>();
+    if value.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    preview
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn submit_report_action(
     session: AuthSession,
     session_generation: Signal<u64>,
-    target: UserSummary,
+    draft: ReportDraft,
     reason: String,
     details: String,
     mut report_status: Signal<String>,
+    mut report_draft: Signal<Option<ReportDraft>>,
+    mut report_reason: Signal<String>,
+    mut report_details: Signal<String>,
 ) {
     let reason = reason.trim().to_string();
     if reason.is_empty() {
@@ -1742,11 +1940,24 @@ fn report_user_action(
         if !session_generation_current(session_generation, generation) {
             return;
         }
-        report_status.set(format!("Reporting {}...", target.display_name));
-        match create_report_api(&session, &target.id.to_string(), reason, details).await {
+        let target_name = draft.target.display_name.clone();
+        report_status.set(format!("Reporting {target_name}..."));
+        match create_report_api(
+            &session,
+            draft.target.id,
+            draft.message_id,
+            draft.message_kind,
+            reason,
+            details,
+        )
+        .await
+        {
             Ok(report_id) => {
                 if session_generation_current(session_generation, generation) {
-                    report_status.set(format!("Report submitted: {report_id}"));
+                    report_draft.set(None);
+                    report_reason.set(String::new());
+                    report_details.set(String::new());
+                    report_status.set(format!("Report submitted for {target_name}: {report_id}"));
                 }
             }
             Err(error) => {
@@ -2283,7 +2494,9 @@ async fn unblock_user_api(session: &AuthSession, user_id: &str) -> Result<bool, 
 #[cfg(windows)]
 async fn create_report_api(
     session: &AuthSession,
-    reported_user_id: &str,
+    reported_user_id: uuid::Uuid,
+    message_id: Option<uuid::Uuid>,
+    message_kind: Option<MessageKind>,
     reason: String,
     details: Option<String>,
 ) -> Result<String, String> {
@@ -2291,11 +2504,9 @@ async fn create_report_api(
         session,
         "/reports",
         &CreateReportRequest {
-            reported_user_id: reported_user_id
-                .parse()
-                .map_err(|error| format!("Invalid user id: {error}"))?,
-            message_id: None,
-            message_kind: None,
+            reported_user_id,
+            message_id,
+            message_kind,
             reason,
             details,
         },
@@ -2438,7 +2649,11 @@ fn credential_safe_name(value: &str) -> String {
 #[cfg(windows)]
 fn server_url() -> String {
     std::env::var("AGORA_SERVER_URL")
-        .unwrap_or_else(|_| "http://localhost".to_string())
+        .unwrap_or_else(|_| {
+            option_env!("AGORA_DEFAULT_SERVER_URL")
+                .unwrap_or("http://localhost")
+                .to_string()
+        })
         .trim_end_matches('/')
         .to_string()
 }
@@ -2536,6 +2751,7 @@ fn chat_mode_overlay_view(
     block_status: Signal<String>,
     report_reason: Signal<String>,
     report_details: Signal<String>,
+    report_draft: Signal<Option<ReportDraft>>,
     report_status: Signal<String>,
 ) -> Element {
     let overlay_tab = if matches!(active, AppTab::Friends | AppTab::BlockReport) {
@@ -2543,6 +2759,10 @@ fn chat_mode_overlay_view(
     } else {
         AppTab::Global
     };
+    let friend_badge = session
+        .as_ref()
+        .map(|session| incoming_friend_request_count(&friendships.read(), session.user.id))
+        .unwrap_or(0);
     let content = match overlay_tab {
         AppTab::Friends => rsx! {
             {friends_panel(
@@ -2566,12 +2786,14 @@ fn chat_mode_overlay_view(
                 block_status,
                 report_reason,
                 report_details,
+                report_draft,
                 report_status,
             )}
         },
         AppTab::Global => rsx! {
             {overlay_global_chat_panel(
                 session,
+                active_tab,
                 session_generation,
                 auth_action_pending,
                 auth_session,
@@ -2591,6 +2813,7 @@ fn chat_mode_overlay_view(
                 block_status,
                 report_reason,
                 report_details,
+                report_draft,
                 report_status,
             )}
         },
@@ -2620,6 +2843,9 @@ fn chat_mode_overlay_view(
                     class: overlay_tab_class(overlay_tab, AppTab::Friends),
                     onclick: move |_| active_tab.set(AppTab::Friends),
                     "Friends"
+                    if friend_badge > 0 {
+                        span { class: "tab-badge", "{friend_badge}" }
+                    }
                 }
                 button {
                     class: overlay_tab_class(overlay_tab, AppTab::BlockReport),
@@ -2638,6 +2864,7 @@ fn chat_mode_overlay_view(
 #[allow(clippy::too_many_arguments)]
 fn overlay_global_chat_panel(
     session: Option<AuthSession>,
+    active_tab: Signal<AppTab>,
     session_generation: Signal<u64>,
     auth_action_pending: Signal<bool>,
     auth_session: Signal<Option<AuthSession>>,
@@ -2657,12 +2884,14 @@ fn overlay_global_chat_panel(
     block_status: Signal<String>,
     report_reason: Signal<String>,
     report_details: Signal<String>,
+    report_draft: Signal<Option<ReportDraft>>,
     report_status: Signal<String>,
 ) -> Element {
     let chat_status_text = chat_status.read().clone();
     let composer_text = composer_body.read().clone();
     let connected = chat_outbox.read().is_some();
     let signed_in = session.is_some();
+    let current_user_id = session.as_ref().map(|session| session.user.id);
     let can_send = signed_in && connected && !composer_text.trim().is_empty();
     let auth_action_pending_value = *auth_action_pending.read();
     let auth_button_label = if signed_in { "Sign off" } else { "Sign in" };
@@ -2710,6 +2939,7 @@ fn overlay_global_chat_panel(
                                     block_status,
                                     report_reason,
                                     report_details,
+                                    report_draft,
                                     report_status,
                                 );
                             } else {
@@ -2726,6 +2956,7 @@ fn overlay_global_chat_panel(
                                     friends_status,
                                     blocked_users,
                                     block_status,
+                                    report_draft,
                                 );
                             }
                         },
@@ -2744,13 +2975,7 @@ fn overlay_global_chat_panel(
                     }
                 } else {
                     for message in recent_messages {
-                        article { key: "{message.id}", class: "overlay-message",
-                            div { class: "message-meta",
-                                strong { "{message.author.display_name}" }
-                                time { "{message.created_at}" }
-                            }
-                            p { "{message.body}" }
-                        }
+                        {global_message_row(message, current_user_id, active_tab, report_draft, report_status)}
                     }
                 }
             }
@@ -2764,6 +2989,9 @@ fn overlay_global_chat_panel(
                 },
                 input {
                     autofocus: true,
+                    onmounted: move |event| async move {
+                        let _ = event.set_focus(true).await;
+                    },
                     placeholder: if signed_in { "Type a global message" } else { "Sign in to chat" },
                     value: "{composer_text}",
                     disabled: !signed_in || !connected,
@@ -2776,6 +3004,146 @@ fn overlay_global_chat_panel(
                 }
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn global_message_row(
+    message: ChatMessage,
+    current_user_id: Option<uuid::Uuid>,
+    mut active_tab: Signal<AppTab>,
+    mut report_draft: Signal<Option<ReportDraft>>,
+    mut report_status: Signal<String>,
+) -> Element {
+    let message_id = message.id;
+    let can_report = current_user_id.is_some_and(|user_id| user_id != message.author.id);
+    let report_message = message.clone();
+
+    rsx! {
+        article { key: "{message_id}", class: "overlay-message",
+            div { class: "message-meta",
+                strong { "{message.author.display_name}" }
+                time { "{message.created_at}" }
+                div { class: "message-actions",
+                    button {
+                        class: "message-action",
+                        r#type: "button",
+                        disabled: !can_report,
+                        onclick: move |_| {
+                            let draft = global_message_report_draft(&report_message);
+                            report_status.set(report_draft_status(&draft));
+                            report_draft.set(Some(draft));
+                            active_tab.set(AppTab::BlockReport);
+                        },
+                        "Report"
+                    }
+                }
+            }
+            p { "{message.body}" }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn friend_sections(
+    friendships: &[FriendshipSummary],
+    current_user_id: uuid::Uuid,
+) -> FriendSections {
+    let mut sections = FriendSections::default();
+    for friendship in friendships {
+        match friendship.status {
+            FriendshipStatus::Accepted => sections.accepted.push(friendship.clone()),
+            FriendshipStatus::Pending if friendship.addressee.id == current_user_id => {
+                sections.incoming.push(friendship.clone());
+            }
+            FriendshipStatus::Pending => sections.outgoing.push(friendship.clone()),
+            FriendshipStatus::Declined | FriendshipStatus::Removed => {
+                sections.inactive.push(friendship.clone());
+            }
+        }
+    }
+    sections
+}
+
+#[cfg(windows)]
+fn incoming_friend_request_count(
+    friendships: &[FriendshipSummary],
+    current_user_id: uuid::Uuid,
+) -> usize {
+    friendships
+        .iter()
+        .filter(|friendship| {
+            friendship.status == FriendshipStatus::Pending
+                && friendship.addressee.id == current_user_id
+        })
+        .count()
+}
+
+#[cfg(all(test, windows))]
+mod relationship_ui_tests {
+    use super::*;
+
+    fn user(id: u128, display_name: &str) -> UserSummary {
+        UserSummary {
+            id: uuid::Uuid::from_u128(id),
+            display_name: display_name.to_string(),
+            avatar_url: None,
+        }
+    }
+
+    fn friendship(
+        status: FriendshipStatus,
+        requester: UserSummary,
+        addressee: UserSummary,
+    ) -> FriendshipSummary {
+        FriendshipSummary {
+            id: uuid::Uuid::new_v4(),
+            requester,
+            addressee,
+            status,
+            created_at: "2026-09-08 18:15:09".to_string(),
+            updated_at: "2026-09-08 18:15:09".to_string(),
+        }
+    }
+
+    #[test]
+    fn splits_friendships_into_dioxus_sections() {
+        let me = user(1, "Me");
+        let incoming = friendship(FriendshipStatus::Pending, user(2, "Alice"), me.clone());
+        let outgoing = friendship(FriendshipStatus::Pending, me.clone(), user(3, "Bob"));
+        let accepted = friendship(FriendshipStatus::Accepted, me.clone(), user(4, "Cora"));
+        let removed = friendship(FriendshipStatus::Removed, me.clone(), user(5, "Dion"));
+        let friendships = vec![
+            incoming.clone(),
+            outgoing.clone(),
+            accepted.clone(),
+            removed.clone(),
+        ];
+
+        let sections = friend_sections(&friendships, me.id);
+
+        assert_eq!(sections.incoming, vec![incoming]);
+        assert_eq!(sections.outgoing, vec![outgoing]);
+        assert_eq!(sections.accepted, vec![accepted]);
+        assert_eq!(sections.inactive, vec![removed]);
+        assert_eq!(incoming_friend_request_count(&friendships, me.id), 1);
+    }
+
+    #[test]
+    fn global_message_report_drafts_keep_message_context() {
+        let message = ChatMessage {
+            id: uuid::Uuid::new_v4(),
+            author: user(2, "Alice"),
+            body: "spam".to_string(),
+            created_at: "2026-09-08 18:15:09".to_string(),
+        };
+
+        let draft = global_message_report_draft(&message);
+
+        assert_eq!(draft.target, message.author);
+        assert_eq!(draft.message_id, Some(message.id));
+        assert_eq!(draft.message_kind, Some(MessageKind::Global));
+        assert_eq!(draft.message_preview.as_deref(), Some("spam"));
     }
 }
 
@@ -2794,6 +3162,21 @@ fn friends_panel(
     let friendship_items = friendships.read().clone();
     let can_use = session.is_some();
     let current_user = session.as_ref().map(|session| session.user.clone());
+    let (accepted, incoming, outgoing, inactive) = current_user
+        .as_ref()
+        .map(|current_user| friend_sections(&friendship_items, current_user.id))
+        .map(|sections| {
+            (
+                sections.accepted,
+                sections.incoming,
+                sections.outgoing,
+                sections.inactive,
+            )
+        })
+        .unwrap_or_default();
+    let accepted_count = accepted.len();
+    let incoming_count = incoming.len();
+    let outgoing_count = outgoing.len();
     let refresh_session = session.clone();
     let search_session = session.clone();
 
@@ -2814,6 +3197,11 @@ fn friends_panel(
                     }
                 }
                 p { "Search for another Agora user, send requests, and manage pending invites." }
+                div { class: "friend-summary-grid",
+                    span { class: "friend-stat", strong { "{accepted_count}" } " Friends" }
+                    span { class: "friend-stat", strong { "{incoming_count}" } " Incoming" }
+                    span { class: "friend-stat", strong { "{outgoing_count}" } " Sent" }
+                }
                 div { class: "search-row",
                     input {
                         placeholder: "Search users",
@@ -2853,15 +3241,82 @@ fn friends_panel(
                 }
             }
 
-            section { class: "relationship-section",
-                h3 { "Friendships" }
-                if friendship_items.is_empty() {
-                    p { class: "muted-copy", "No friend records yet." }
-                } else if let Some(current_user) = current_user {
-                    div { class: "relationship-list",
-                        for friendship in friendship_items {
-                            {friendship_row(friendship, current_user.clone(), session.clone(), session_generation, friendships, friends_status)}
-                        }
+            if let Some(current_user) = current_user {
+                {friendship_section(
+                    "Incoming Requests",
+                    incoming,
+                    "No incoming friend requests.",
+                    current_user.clone(),
+                    session.clone(),
+                    session_generation,
+                    friendships,
+                    friends_status,
+                )}
+                {friendship_section(
+                    "Friends",
+                    accepted,
+                    "No accepted friends yet.",
+                    current_user.clone(),
+                    session.clone(),
+                    session_generation,
+                    friendships,
+                    friends_status,
+                )}
+                {friendship_section(
+                    "Sent Requests",
+                    outgoing,
+                    "No outgoing friend requests.",
+                    current_user.clone(),
+                    session.clone(),
+                    session_generation,
+                    friendships,
+                    friends_status,
+                )}
+                if !inactive.is_empty() {
+                    {friendship_section(
+                        "Inactive Records",
+                        inactive,
+                        "No inactive friend records.",
+                        current_user,
+                        session.clone(),
+                        session_generation,
+                        friendships,
+                        friends_status,
+                    )}
+                }
+            } else {
+                section { class: "relationship-section",
+                    h3 { "Friends" }
+                    p { class: "muted-copy", "Sign in to manage friends." }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn friendship_section(
+    title: &'static str,
+    items: Vec<FriendshipSummary>,
+    empty: &'static str,
+    current_user: UserSummary,
+    session: Option<AuthSession>,
+    session_generation: Signal<u64>,
+    friendships: Signal<Vec<FriendshipSummary>>,
+    friends_status: Signal<String>,
+) -> Element {
+    let count = items.len();
+
+    rsx! {
+        section { class: "relationship-section",
+            h3 { "{title} ({count})" }
+            if items.is_empty() {
+                p { class: "muted-copy", "{empty}" }
+            } else {
+                div { class: "relationship-list",
+                    for friendship in items {
+                        {friendship_row(friendship, current_user.clone(), session.clone(), session_generation, friendships, friends_status)}
                     }
                 }
             }
@@ -3014,7 +3469,8 @@ fn block_report_panel(
     block_status: Signal<String>,
     mut report_reason: Signal<String>,
     mut report_details: Signal<String>,
-    report_status: Signal<String>,
+    mut report_draft: Signal<Option<ReportDraft>>,
+    mut report_status: Signal<String>,
 ) -> Element {
     let query = block_search_query.read().clone();
     let results = block_search_results.read().clone();
@@ -3022,10 +3478,30 @@ fn block_report_panel(
     let block_status_text = block_status.read().clone();
     let reason_text = report_reason.read().clone();
     let details_text = report_details.read().clone();
+    let selected_report = report_draft.read().clone();
     let report_status_text = report_status.read().clone();
     let can_use = session.is_some();
+    let can_submit_report = can_use && selected_report.is_some() && !reason_text.trim().is_empty();
+    let report_kind = selected_report
+        .as_ref()
+        .map(report_draft_kind_label)
+        .unwrap_or("No target");
+    let report_target_name = selected_report
+        .as_ref()
+        .map(|draft| draft.target.display_name.clone())
+        .unwrap_or_else(|| "Select a user or chat message".to_string());
+    let report_target_id = selected_report
+        .as_ref()
+        .map(|draft| draft.target.id.to_string())
+        .unwrap_or_default();
+    let report_preview = selected_report
+        .as_ref()
+        .and_then(|draft| draft.message_preview.as_ref())
+        .map(|body| report_preview_text(body));
     let refresh_session = session.clone();
     let search_session = session.clone();
+    let submit_session = session.clone();
+    let submit_report = selected_report.clone();
 
     rsx! {
         div { class: "relationship-layout",
@@ -3072,6 +3548,16 @@ fn block_report_panel(
 
             section { class: "relationship-section",
                 h3 { "Report Details" }
+                div { class: "report-target-card",
+                    span { class: "report-target-kind", "{report_kind}" }
+                    strong { "{report_target_name}" }
+                    if !report_target_id.is_empty() {
+                        span { "{report_target_id}" }
+                    }
+                    if let Some(preview) = report_preview {
+                        p { class: "report-preview", "\"{preview}\"" }
+                    }
+                }
                 div { class: "report-fields",
                     input {
                         placeholder: "Reason, e.g. harassment or spam",
@@ -3084,6 +3570,37 @@ fn block_report_panel(
                         value: "{details_text}",
                         disabled: !can_use,
                         oninput: move |event| report_details.set(event.value())
+                    }
+                }
+                div { class: "report-submit-row",
+                    button {
+                        class: "secondary-button compact",
+                        disabled: !can_submit_report,
+                        onclick: move |_| {
+                            if let (Some(session), Some(draft)) = (submit_session.clone(), submit_report.clone()) {
+                                submit_report_action(
+                                    session,
+                                    session_generation,
+                                    draft,
+                                    report_reason.read().clone(),
+                                    report_details.read().clone(),
+                                    report_status,
+                                    report_draft,
+                                    report_reason,
+                                    report_details,
+                                );
+                            }
+                        },
+                        "Submit Report"
+                    }
+                    button {
+                        class: "secondary-button compact",
+                        disabled: selected_report.is_none(),
+                        onclick: move |_| {
+                            report_draft.set(None);
+                            report_status.set("Select a user or message to report".to_string());
+                        },
+                        "Clear"
                     }
                 }
                 span { class: "panel-status", "{report_status_text}" }
@@ -3104,8 +3621,7 @@ fn block_report_panel(
                                 friends_status,
                                 blocked_users,
                                 block_status,
-                                report_reason,
-                                report_details,
+                                report_draft,
                                 report_status,
                             )}
                         }
@@ -3139,16 +3655,13 @@ fn block_report_user_row(
     friends_status: Signal<String>,
     blocked_users: Signal<Vec<UserSummary>>,
     block_status: Signal<String>,
-    report_reason: Signal<String>,
-    report_details: Signal<String>,
-    report_status: Signal<String>,
+    mut report_draft: Signal<Option<ReportDraft>>,
+    mut report_status: Signal<String>,
 ) -> Element {
     let user_id = user.id.to_string();
     let display_name = user.display_name.clone();
-    let reason_present = !report_reason.read().trim().is_empty();
     let actions_disabled = session.is_none();
     let block_session = session.clone();
-    let report_session = session.clone();
     let block_target = user.clone();
     let report_target = user.clone();
 
@@ -3179,18 +3692,11 @@ fn block_report_user_row(
                 }
                 button {
                     class: "secondary-button compact",
-                    disabled: actions_disabled || !reason_present,
+                    disabled: actions_disabled,
                     onclick: move |_| {
-                        if let Some(session) = report_session.clone() {
-                            report_user_action(
-                                session,
-                                session_generation,
-                                report_target.clone(),
-                                report_reason.read().clone(),
-                                report_details.read().clone(),
-                                report_status,
-                            );
-                        }
+                        let draft = user_report_draft(report_target.clone());
+                        report_status.set(report_draft_status(&draft));
+                        report_draft.set(Some(draft));
                     },
                     "Report"
                 }
@@ -3410,6 +3916,22 @@ p {
     margin-bottom: 4px;
 }
 
+.message-actions {
+    display: flex;
+    margin-left: auto;
+    gap: 6px;
+}
+
+.message-action {
+    padding: 2px 7px;
+    border: 1px solid rgba(236, 212, 139, 0.35);
+    border-radius: 999px;
+    color: var(--aom-frame-bright);
+    background: rgba(255, 255, 255, 0.06);
+    font-size: 10px;
+    cursor: pointer;
+}
+
 .message-meta time {
     color: #9f9487;
     font-size: 12px;
@@ -3437,6 +3959,10 @@ p {
 }
 
 .overlay-tab {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
     width: 100%;
     padding: 10px 12px;
     border: 1px solid var(--aom-frame);
@@ -3453,6 +3979,16 @@ p {
     color: #fff8ed;
     border-color: var(--aom-frame-bright);
     background: linear-gradient(180deg, var(--aom-button-top), var(--aom-button-bottom));
+}
+
+.tab-badge {
+    min-width: 18px;
+    padding: 2px 5px;
+    border-radius: 999px;
+    color: #1b1207;
+    background: var(--aom-frame-bright);
+    font-size: 10px;
+    text-align: center;
 }
 
 .overlay-content {
@@ -3708,6 +4244,26 @@ p {
     gap: 16px;
 }
 
+.friend-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.friend-stat {
+    padding: 9px 10px;
+    border: 1px solid rgba(236, 212, 139, 0.22);
+    border-radius: 4px;
+    color: var(--aom-muted);
+    background: #080a0a;
+    font-size: 12px;
+}
+
+.friend-stat strong {
+    color: var(--aom-frame-bright);
+}
+
 .tool-card,
 .relationship-section {
     padding: 18px;
@@ -3811,6 +4367,45 @@ p {
 .report-fields {
     display: grid;
     gap: 10px;
+}
+
+.report-target-card {
+    display: grid;
+    gap: 4px;
+    margin-bottom: 10px;
+    padding: 10px;
+    border: 1px solid rgba(236, 212, 139, 0.22);
+    border-radius: 4px;
+    background: #080a0a;
+}
+
+.report-target-card strong,
+.report-target-card span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.report-target-card span,
+.report-preview {
+    color: var(--aom-muted);
+    font-size: 12px;
+}
+
+.report-target-kind {
+    color: var(--aom-frame-bright) !important;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.report-preview {
+    overflow-wrap: anywhere;
+}
+
+.report-submit-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
 }
 
 .report-fields textarea {

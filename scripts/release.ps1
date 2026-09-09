@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$SkipChecks
+    [switch]$SkipChecks,
+    [string]$ServerUrl = "https://chat.aomagora.com"
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,9 +24,14 @@ function Invoke-CargoStep {
 }
 
 $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$PreviousDefaultServerUrl = [Environment]::GetEnvironmentVariable("AGORA_DEFAULT_SERVER_URL", "Process")
 
 Push-Location -LiteralPath $RepoRoot
 try {
+    if (-not ($ServerUrl -match '^https?://[^\s/]+')) {
+        throw "ServerUrl must be an absolute http(s) URL"
+    }
+
     if (-not $SkipChecks) {
         Invoke-CargoStep "Checking formatting" { cargo fmt --all -- --check }
         Invoke-CargoStep "Running clippy" { cargo clippy --workspace --all-targets -- -D warnings }
@@ -33,7 +39,8 @@ try {
     }
 
     Invoke-CargoStep "Building release server" { cargo build --locked --release -p agora-server }
-    Invoke-CargoStep "Building release client" { cargo build --locked --release -p agora-client }
+    [Environment]::SetEnvironmentVariable("AGORA_DEFAULT_SERVER_URL", $ServerUrl.TrimEnd('/'), "Process")
+    Invoke-CargoStep "Building release client for $($ServerUrl.TrimEnd('/'))" { cargo build --locked --release -p agora-client }
 
     $metadataJson = & cargo metadata --no-deps --format-version 1
     if ($LASTEXITCODE -ne 0) {
@@ -72,5 +79,6 @@ try {
     "  $archivePath"
 }
 finally {
+    [Environment]::SetEnvironmentVariable("AGORA_DEFAULT_SERVER_URL", $PreviousDefaultServerUrl, "Process")
     Pop-Location
 }

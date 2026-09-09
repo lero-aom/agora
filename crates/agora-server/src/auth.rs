@@ -180,19 +180,8 @@ async fn steam_login_callback(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     match complete_steam_login(&state, &query).await {
-        Ok(user) => Html(format!(
-            r#"<!doctype html><title>Agora Steam Login</title><body style="font-family: sans-serif; background: #100b18; color: #f7efe2;"><h1>Steam login complete</h1><p>Signed in as <strong>{}</strong>. You can return to Agora.</p></body>"#,
-            html_escape(&user.display_name)
-        ))
-        .into_response(),
-        Err(error) => (
-            error.status,
-            Html(format!(
-                r#"<!doctype html><title>Agora Steam Login</title><body style="font-family: sans-serif; background: #100b18; color: #f7efe2;"><h1>Steam login failed</h1><p>{}</p></body>"#,
-                html_escape(&error.message)
-            )),
-        )
-            .into_response(),
+        Ok(user) => Html(steam_login_success_page(&user.display_name)).into_response(),
+        Err(error) => (error.status, Html(steam_login_error_page(&error.message))).into_response(),
     }
 }
 
@@ -704,14 +693,27 @@ async fn steam_profile(state: &AppState, steam_id: &str) -> SteamProfile {
         display_name: format!("Steam {steam_id}"),
         avatar_url: None,
     };
-    let Some(api_key) = state.config.steam_web_api_key.as_ref() else {
-        return fallback();
-    };
 
+    if let Some(api_key) = state.config.steam_web_api_key.as_ref() {
+        if let Some(profile) = steam_web_api_profile(state, steam_id, api_key).await {
+            return profile;
+        }
+    }
+
+    steam_community_profile(state, steam_id)
+        .await
+        .unwrap_or_else(fallback)
+}
+
+async fn steam_web_api_profile(
+    state: &AppState,
+    steam_id: &str,
+    api_key: &str,
+) -> Option<SteamProfile> {
     let response = state
         .http
         .get("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/")
-        .query(&[("key", api_key.as_str()), ("steamids", steam_id)])
+        .query(&[("key", api_key), ("steamids", steam_id)])
         .send()
         .await;
 
@@ -725,18 +727,77 @@ async fn steam_profile(state: &AppState, steam_id: &str) -> SteamProfile {
                 .map(|player| SteamProfile {
                     display_name: non_empty_or(player.personaname, format!("Steam {steam_id}")),
                     avatar_url: player.avatarfull.or(player.avatarmedium).or(player.avatar),
-                })
-                .unwrap_or_else(fallback),
+                }),
             Err(error) => {
                 warn!(%error, "failed to parse Steam profile response");
-                fallback()
+                None
             }
         },
         Err(error) => {
             warn!(%error, "failed to fetch Steam profile");
-            fallback()
+            None
         }
     }
+}
+
+async fn steam_community_profile(state: &AppState, steam_id: &str) -> Option<SteamProfile> {
+    let response = state
+        .http
+        .get(format!("https://steamcommunity.com/profiles/{steam_id}"))
+        .query(&[("xml", "1")])
+        .send()
+        .await;
+
+    match response {
+        Ok(response) if response.status().is_success() => match response.text().await {
+            Ok(body) => Some(parse_steam_community_profile(steam_id, &body)),
+            Err(error) => {
+                warn!(%error, "failed to read Steam community profile response");
+                None
+            }
+        },
+        Ok(response) => {
+            warn!(status = %response.status(), "Steam community profile returned non-success status");
+            None
+        }
+        Err(error) => {
+            warn!(%error, "failed to fetch Steam community profile");
+            None
+        }
+    }
+}
+
+fn parse_steam_community_profile(steam_id: &str, xml: &str) -> SteamProfile {
+    SteamProfile {
+        display_name: non_empty_or(xml_tag_text(xml, "steamID"), format!("Steam {steam_id}")),
+        avatar_url: xml_tag_text(xml, "avatarFull")
+            .or_else(|| xml_tag_text(xml, "avatarMedium"))
+            .or_else(|| xml_tag_text(xml, "avatarIcon")),
+    }
+}
+
+fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    let value = xml[start..end].trim();
+    let value = value
+        .strip_prefix("<![CDATA[")
+        .and_then(|value| value.strip_suffix("]]>"))
+        .unwrap_or(value)
+        .trim();
+    let value = xml_unescape(value).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 async fn create_session(
@@ -878,6 +939,124 @@ fn validate_openid_return_to(
 fn steam_return_to(public_url: &str, challenge_id: Uuid) -> String {
     let public_url = public_url.trim_end_matches('/');
     format!("{public_url}/auth/steam/callback?challenge_id={challenge_id}")
+}
+
+fn steam_login_success_page(display_name: &str) -> String {
+    steam_login_page(
+        "Steam login complete",
+        "Steam login complete",
+        &format!(
+            "Signed in as <strong>{}</strong>. You can return to AOM.",
+            html_escape(display_name)
+        ),
+        false,
+    )
+}
+
+fn steam_login_error_page(message: &str) -> String {
+    steam_login_page(
+        "Steam login failed",
+        "Steam login failed",
+        &html_escape(message),
+        true,
+    )
+}
+
+fn steam_login_page(title: &str, heading: &str, message_html: &str, error: bool) -> String {
+    let status_html = if error {
+        r#"<span class="status error">Try again</span>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{}</title>
+<style>
+:root {{
+    --aom-bg: #070909;
+    --aom-panel-top: #171815;
+    --aom-panel-bottom: #070909;
+    --aom-frame: #a57932;
+    --aom-frame-mid: #c49845;
+    --aom-frame-bright: #ecd48b;
+    --aom-frame-dark: #251806;
+    --aom-text: #f5efe0;
+    --aom-muted: #b2a78f;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+    display: grid;
+    min-height: 100vh;
+    margin: 0;
+    place-items: center;
+    color: var(--aom-text);
+    background: radial-gradient(circle at top, #1d1e19 0, var(--aom-bg) 56%);
+    font-family: Segoe UI, system-ui, sans-serif;
+}}
+.card {{
+    width: min(92vw, 520px);
+    padding: 28px;
+    border: 3px solid var(--aom-frame-mid);
+    border-radius: 6px;
+    background: linear-gradient(180deg, var(--aom-panel-top), var(--aom-panel-bottom));
+    box-shadow: inset 0 0 0 1px var(--aom-frame-bright), 0 0 0 1px var(--aom-frame-dark), 0 18px 52px rgba(0, 0, 0, 0.5);
+}}
+.eyebrow {{
+    margin-bottom: 10px;
+    color: var(--aom-frame-bright);
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+}}
+h1 {{
+    margin: 0 0 12px;
+    font-size: clamp(28px, 6vw, 42px);
+    line-height: 1;
+}}
+p {{
+    margin: 0;
+    color: var(--aom-muted);
+    font-size: 17px;
+    line-height: 1.5;
+}}
+strong {{ color: var(--aom-text); }}
+.status {{
+    display: inline-block;
+    margin-top: 22px;
+    padding: 8px 11px;
+    border: 1px solid var(--aom-frame-bright);
+    border-radius: 999px;
+    color: #1b1207;
+    background: linear-gradient(180deg, #d6b45b, #7c5e23);
+    font-size: 12px;
+    font-weight: 800;
+}}
+.status.error {{
+    color: #fecaca;
+    border-color: #7f1d1d;
+    background: rgba(127, 29, 29, .35);
+}}
+</style>
+</head>
+<body>
+<main class="card">
+    <div class="eyebrow">Agora</div>
+    <h1>{}</h1>
+    <p>{}</p>
+    {}
+</main>
+</body>
+</html>"#,
+        html_escape(title),
+        html_escape(heading),
+        message_html,
+        status_html
+    )
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -1104,6 +1283,57 @@ mod tests {
         let url = steam_login_url("https://agora.example", Uuid::nil()).unwrap();
 
         assert!(url.contains("openid.realm=https%3A%2F%2Fagora.example"));
+    }
+
+    #[test]
+    fn success_page_tells_users_to_return_to_aom() {
+        let page = steam_login_success_page("Arkantos");
+
+        assert!(page.contains("Signed in as <strong>Arkantos</strong>."));
+        assert!(page.contains("You can return to AOM."));
+        assert!(!page.contains("Ready"));
+        assert!(!page.contains("return to Agora"));
+    }
+
+    #[test]
+    fn parses_steam_community_profile_name_and_avatar() {
+        let profile = parse_steam_community_profile(
+            "76561198000000000",
+            r#"
+            <profile>
+                <steamID><![CDATA[Ark & Zeus]]></steamID>
+                <avatarFull><![CDATA[https://avatars.steamstatic.com/full.jpg]]></avatarFull>
+            </profile>
+            "#,
+        );
+
+        assert_eq!(profile.display_name, "Ark & Zeus");
+        assert_eq!(
+            profile.avatar_url,
+            Some("https://avatars.steamstatic.com/full.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn steam_community_profile_falls_back_to_steam_id_when_name_is_missing() {
+        let profile = parse_steam_community_profile(
+            "76561198000000000",
+            r#"<profile><avatarMedium>https://avatars.steamstatic.com/medium.jpg</avatarMedium></profile>"#,
+        );
+
+        assert_eq!(profile.display_name, "Steam 76561198000000000");
+        assert_eq!(
+            profile.avatar_url,
+            Some("https://avatars.steamstatic.com/medium.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn xml_tag_text_decodes_entities() {
+        assert_eq!(
+            xml_tag_text("<steamID>Ark &amp; Zeus</steamID>", "steamID").as_deref(),
+            Some("Ark & Zeus")
+        );
     }
 
     #[test]
