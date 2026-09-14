@@ -14,11 +14,11 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use sqlx::{postgres::PgRow, Row};
+use sqlx::{postgres::PgRow, Postgres, Row, Transaction};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{auth, AppState};
+use crate::{auth, chat, visibility, AppState};
 
 const USER_SEARCH_LIMIT: i64 = 20;
 const MAX_REASON_LEN: usize = 500;
@@ -63,21 +63,24 @@ async fn search_users(
     }
 
     let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
-    let rows = sqlx::query(
+    let sql = format!(
         "select id, display_name, avatar_url
          from users
          where id <> $1
            and banned_at is null
            and (suspended_until is null or suspended_until <= now())
+           and {}
            and display_name ilike $2 escape '\\'
          order by display_name asc
          limit $3",
-    )
-    .bind(user.id)
-    .bind(pattern)
-    .bind(USER_SEARCH_LIMIT)
-    .fetch_all(&state.db)
-    .await?;
+        visibility::not_blocked_between_sql("$1", "users.id")
+    );
+    let rows = sqlx::query(&sql)
+        .bind(user.id)
+        .bind(pattern)
+        .bind(USER_SEARCH_LIMIT)
+        .fetch_all(&state.db)
+        .await?;
 
     Ok(Json(UserSearchResponse {
         users: rows
@@ -122,17 +125,20 @@ async fn send_friend_request(
             "cannot send a friend request to yourself",
         ));
     }
-    if blocked_between(&state, user.id, target.id).await? {
+    let mut tx = state.db.begin().await?;
+    lock_relationship_pair(&mut tx, user.id, target.id).await?;
+    if visibility::blocked_between_tx(&mut tx, user.id, target.id).await? {
+        tx.rollback().await?;
         return Err(RelationshipError::conflict(
             "friend request is blocked by an existing block",
         ));
     }
 
-    let friendship_id = match existing_friendship(&state, user.id, target.id).await? {
+    let friendship_id = match existing_friendship_tx(&mut tx, user.id, target.id).await? {
         Some(existing)
             if existing.status == FriendshipStatus::Pending && existing.addressee.id == user.id =>
         {
-            update_friendship_status(&state, existing.id, FriendshipStatus::Accepted).await?
+            update_friendship_status(&mut tx, existing.id, FriendshipStatus::Accepted).await?
         }
         Some(existing)
             if matches!(
@@ -154,7 +160,7 @@ async fn send_friend_request(
             .bind(existing.id)
             .bind(user.id)
             .bind(target.id)
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await?;
             existing.id
         }
@@ -166,11 +172,13 @@ async fn send_friend_request(
             )
             .bind(user.id)
             .bind(target.id)
-            .fetch_one(&state.db)
+            .fetch_one(&mut *tx)
             .await?;
             row.try_get("id")?
         }
     };
+    tx.commit().await?;
+    send_relationship_changed(&state, user.id, target.id);
 
     Ok(Json(FriendshipResponse {
         friendship: friendship_by_id(&state, friendship_id).await?,
@@ -185,8 +193,14 @@ async fn accept_friend_request(
 ) -> RelationshipResult<Json<FriendshipResponse>> {
     check_relationship_write_limit(&state, peer_addr, &headers).await?;
     let user = current_user(&state, &headers).await?;
-    update_incoming_pending_friendship(&state, friendship_id, user.id, FriendshipStatus::Accepted)
-        .await?;
+    let (requester_id, addressee_id) = update_incoming_pending_friendship(
+        &state,
+        friendship_id,
+        user.id,
+        FriendshipStatus::Accepted,
+    )
+    .await?;
+    send_relationship_changed(&state, requester_id, addressee_id);
 
     Ok(Json(FriendshipResponse {
         friendship: friendship_by_id(&state, friendship_id).await?,
@@ -201,8 +215,14 @@ async fn decline_friend_request(
 ) -> RelationshipResult<Json<FriendshipResponse>> {
     check_relationship_write_limit(&state, peer_addr, &headers).await?;
     let user = current_user(&state, &headers).await?;
-    update_incoming_pending_friendship(&state, friendship_id, user.id, FriendshipStatus::Declined)
-        .await?;
+    let (requester_id, addressee_id) = update_incoming_pending_friendship(
+        &state,
+        friendship_id,
+        user.id,
+        FriendshipStatus::Declined,
+    )
+    .await?;
+    send_relationship_changed(&state, requester_id, addressee_id);
 
     Ok(Json(FriendshipResponse {
         friendship: friendship_by_id(&state, friendship_id).await?,
@@ -217,6 +237,8 @@ async fn remove_friendship(
 ) -> RelationshipResult<Json<RemoveFriendResponse>> {
     check_relationship_write_limit(&state, peer_addr, &headers).await?;
     let user = current_user(&state, &headers).await?;
+    let mut tx = state.db.begin().await?;
+    lock_relationship_pair(&mut tx, user.id, user_id).await?;
     let result = sqlx::query(
         "update friendships
          set status = 'removed', updated_at = now()
@@ -226,8 +248,12 @@ async fn remove_friendship(
     )
     .bind(user.id)
     .bind(user_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
+    if result.rows_affected() > 0 {
+        send_relationship_changed(&state, user.id, user_id);
+    }
 
     Ok(Json(RemoveFriendResponse {
         removed: result.rows_affected() > 0,
@@ -274,6 +300,7 @@ async fn block_user(
     }
 
     let mut tx = state.db.begin().await?;
+    lock_relationship_pair(&mut tx, user.id, target.id).await?;
     sqlx::query(
         "insert into blocks (blocker_id, blocked_id)
          values ($1, $2)
@@ -295,6 +322,17 @@ async fn block_user(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    send_relationship_changed(&state, user.id, target.id);
+    chat::send_user_event(
+        &state.chat_tx,
+        user.id,
+        agora_common::ServerEvent::UserMessagesHidden { user_id: target.id },
+    );
+    chat::send_user_event(
+        &state.chat_tx,
+        target.id,
+        agora_common::ServerEvent::UserMessagesHidden { user_id: user.id },
+    );
 
     Ok(Json(BlockUserResponse { blocked: true }))
 }
@@ -307,11 +345,17 @@ async fn unblock_user(
 ) -> RelationshipResult<Json<UnblockUserResponse>> {
     check_relationship_write_limit(&state, peer_addr, &headers).await?;
     let user = current_user(&state, &headers).await?;
+    let mut tx = state.db.begin().await?;
+    lock_relationship_pair(&mut tx, user.id, user_id).await?;
     let result = sqlx::query("delete from blocks where blocker_id = $1 and blocked_id = $2")
         .bind(user.id)
         .bind(user_id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
+    if result.rows_affected() > 0 {
+        send_relationship_changed(&state, user.id, user_id);
+    }
 
     Ok(Json(UnblockUserResponse {
         unblocked: result.rows_affected() > 0,
@@ -368,6 +412,19 @@ async fn current_user(state: &AppState, headers: &HeaderMap) -> RelationshipResu
         .ok_or_else(|| RelationshipError::unauthorized("session is invalid or expired"))
 }
 
+fn send_relationship_changed(state: &AppState, first: Uuid, second: Uuid) {
+    chat::send_user_event(
+        &state.chat_tx,
+        first,
+        agora_common::ServerEvent::RelationshipStateChanged,
+    );
+    chat::send_user_event(
+        &state.chat_tx,
+        second,
+        agora_common::ServerEvent::RelationshipStateChanged,
+    );
+}
+
 async fn check_relationship_read_limit(
     state: &AppState,
     peer_addr: SocketAddr,
@@ -410,23 +467,21 @@ async fn user_by_id(state: &AppState, user_id: Uuid) -> RelationshipResult<UserS
     Ok(row_to_user(&row)?)
 }
 
-async fn blocked_between(state: &AppState, first: Uuid, second: Uuid) -> RelationshipResult<bool> {
-    Ok(sqlx::query_scalar::<_, bool>(
-        "select exists(
-            select 1
-            from blocks
-            where (blocker_id = $1 and blocked_id = $2)
-               or (blocker_id = $2 and blocked_id = $1)
-        )",
-    )
-    .bind(first)
-    .bind(second)
-    .fetch_one(&state.db)
-    .await?)
+async fn lock_relationship_pair(
+    tx: &mut Transaction<'_, Postgres>,
+    first: Uuid,
+    second: Uuid,
+) -> RelationshipResult<()> {
+    sqlx::query("select lock_relationship_pair($1, $2)")
+        .bind(first)
+        .bind(second)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
-async fn existing_friendship(
-    state: &AppState,
+async fn existing_friendship_tx(
+    tx: &mut Transaction<'_, Postgres>,
     first: Uuid,
     second: Uuid,
 ) -> RelationshipResult<Option<FriendshipSummary>> {
@@ -437,7 +492,7 @@ async fn existing_friendship(
     let row = sqlx::query(&sql)
         .bind(first)
         .bind(second)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut **tx)
         .await?;
 
     row.as_ref().map(row_to_friendship).transpose()
@@ -448,8 +503,37 @@ async fn update_incoming_pending_friendship(
     friendship_id: Uuid,
     user_id: Uuid,
     status: FriendshipStatus,
-) -> RelationshipResult<()> {
+) -> RelationshipResult<(Uuid, Uuid)> {
     let status = friendship_status_as_str(status);
+    let mut tx = state.db.begin().await?;
+    let Some(row) = sqlx::query(
+        "select requester_id, addressee_id
+         from friendships
+         where id = $1 and addressee_id = $2",
+    )
+    .bind(friendship_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.rollback().await?;
+        return Err(RelationshipError::forbidden(
+            "friend request is not pending for this user",
+        ));
+    };
+    let requester_id = row.try_get("requester_id")?;
+    let addressee_id = row.try_get("addressee_id")?;
+    lock_relationship_pair(&mut tx, requester_id, addressee_id).await?;
+
+    if status == "accepted"
+        && visibility::blocked_between_tx(&mut tx, requester_id, addressee_id).await?
+    {
+        tx.rollback().await?;
+        return Err(RelationshipError::conflict(
+            "friend request is blocked by an existing block",
+        ));
+    }
+
     let updated = sqlx::query(
         "update friendships
          set status = $3, updated_at = now()
@@ -459,12 +543,14 @@ async fn update_incoming_pending_friendship(
     .bind(friendship_id)
     .bind(user_id)
     .bind(status)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if updated.is_some() {
-        Ok(())
+        tx.commit().await?;
+        Ok((requester_id, addressee_id))
     } else {
+        tx.rollback().await?;
         Err(RelationshipError::forbidden(
             "friend request is not pending for this user",
         ))
@@ -472,7 +558,7 @@ async fn update_incoming_pending_friendship(
 }
 
 async fn update_friendship_status(
-    state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
     friendship_id: Uuid,
     status: FriendshipStatus,
 ) -> RelationshipResult<Uuid> {
@@ -483,7 +569,7 @@ async fn update_friendship_status(
     )
     .bind(friendship_id)
     .bind(friendship_status_as_str(status))
-    .execute(&state.db)
+    .execute(&mut **tx)
     .await?;
     Ok(friendship_id)
 }
@@ -733,6 +819,14 @@ impl IntoResponse for RelationshipError {
 
 impl From<sqlx::Error> for RelationshipError {
     fn from(error: sqlx::Error) -> Self {
+        if let sqlx::Error::Database(database_error) = &error {
+            if database_error.code().as_deref() == Some("23514")
+                && database_error.message().contains("active friendship")
+            {
+                return Self::conflict("friend request is blocked by an existing block");
+            }
+        }
+
         warn!(%error, "database error in relationship route");
         Self::internal("database operation failed")
     }

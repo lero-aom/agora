@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_MESSAGE_LEN: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +187,22 @@ pub enum MessageKind {
     Dm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserRole {
+    User,
+    Moderator,
+    Admin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportStatus {
+    Open,
+    Resolved,
+    Dismissed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateReportRequest {
     pub reported_user_id: Uuid,
@@ -199,6 +215,103 @@ pub struct CreateReportRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateReportResponse {
     pub id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportListResponse {
+    pub reports: Vec<ReportSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportSummary {
+    pub id: Uuid,
+    pub reporter: UserSummary,
+    pub reported_user: UserSummary,
+    pub message_id: Option<Uuid>,
+    pub message_kind: Option<MessageKind>,
+    pub reason: String,
+    pub status: ReportStatus,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+    pub resolved_by: Option<UserSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportDetailResponse {
+    pub report: ReportDetail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportDetail {
+    pub summary: ReportSummary,
+    pub details: Option<String>,
+    pub message: Option<ReportedMessage>,
+    pub actions: Vec<ModerationActionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportedMessage {
+    pub id: Uuid,
+    pub kind: MessageKind,
+    pub author: UserSummary,
+    pub body: Option<String>,
+    pub created_at: String,
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModerationActionKind {
+    DeleteGlobalMessage,
+    Suspend,
+    Ban,
+    Unban,
+    ResolveReport,
+    DismissReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModerationActionSummary {
+    pub id: Uuid,
+    pub moderator: UserSummary,
+    pub target_user: UserSummary,
+    pub report_id: Option<Uuid>,
+    pub message_id: Option<Uuid>,
+    pub message_kind: Option<MessageKind>,
+    pub action: ModerationActionKind,
+    pub reason: String,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModerationReasonRequest {
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteGlobalMessageRequest {
+    pub reason: String,
+    pub report_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuspendUserRequest {
+    pub reason: String,
+    pub duration_seconds: u64,
+    pub report_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BanUserRequest {
+    pub reason: String,
+    pub report_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModerationActionResponse {
+    pub action: ModerationActionSummary,
+    pub revoked_sessions: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,9 +334,6 @@ pub enum ClientEvent {
     Heartbeat,
     PresenceUpdate { state: PresenceState },
     GlobalMessageSend { body: String },
-    DmMessageSend { thread_id: Uuid, body: String },
-    ReportUser { user_id: Uuid, reason: String },
-    ReportMessage { message_id: Uuid, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,7 +348,13 @@ pub enum ServerEvent {
     },
     PresenceCounts(PresenceCounts),
     GlobalMessageCreated(ChatMessage),
-    DmMessageCreated(ChatMessage),
+    GlobalMessageDeleted {
+        message_id: Uuid,
+    },
+    UserMessagesHidden {
+        user_id: Uuid,
+    },
+    RelationshipStateChanged,
     Error {
         message: String,
     },

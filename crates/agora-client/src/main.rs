@@ -240,6 +240,10 @@ fn App() -> Element {
                                 chat_status,
                                 presence_counts,
                                 chat_outbox,
+                                friendships,
+                                friends_status,
+                                blocked_users,
+                                block_status,
                             );
                             refresh_relationship_state(
                                 &session,
@@ -1269,6 +1273,10 @@ fn start_session_refresh_loop(
                         chat_status,
                         presence_counts,
                         chat_outbox,
+                        friendships,
+                        friends_status,
+                        blocked_users,
+                        block_status,
                     );
                     refresh_relationship_state(
                         &refreshed,
@@ -1386,6 +1394,10 @@ fn sign_in_session(
                     chat_status,
                     presence_counts,
                     chat_outbox,
+                    friendships,
+                    friends_status,
+                    blocked_users,
+                    block_status,
                 );
                 refresh_relationship_state(
                     &session,
@@ -1791,12 +1803,14 @@ fn block_user_action(
     session: AuthSession,
     session_generation: Signal<u64>,
     target: UserSummary,
+    mut chat_messages: Signal<Vec<ChatMessage>>,
     blocked_users: Signal<Vec<UserSummary>>,
     mut block_status: Signal<String>,
     friendships: Signal<Vec<FriendshipSummary>>,
     friends_status: Signal<String>,
 ) {
     let generation = *session_generation.read();
+    let blocked_user_id = target.id;
     spawn(async move {
         if !session_generation_current(session_generation, generation) {
             return;
@@ -1806,6 +1820,10 @@ fn block_user_action(
             Ok(_) => {
                 if !session_generation_current(session_generation, generation) {
                     return;
+                }
+                {
+                    let mut messages = chat_messages.write();
+                    remove_blocked_user_messages(&mut messages, blocked_user_id);
                 }
                 block_status.set(format!("Blocked {}", target.display_name));
                 load_blocks(
@@ -1823,6 +1841,11 @@ fn block_user_action(
             }
         }
     });
+}
+
+#[cfg(windows)]
+fn remove_blocked_user_messages(messages: &mut Vec<ChatMessage>, blocked_user_id: uuid::Uuid) {
+    messages.retain(|message| message.author.id != blocked_user_id);
 }
 
 #[cfg(windows)]
@@ -1977,28 +2000,34 @@ fn start_chat_session(
     mut chat_status: Signal<String>,
     mut presence_counts: Signal<PresenceCounts>,
     mut chat_outbox: Signal<Option<UnboundedSender<ClientEvent>>>,
+    friendships: Signal<Vec<FriendshipSummary>>,
+    friends_status: Signal<String>,
+    blocked_users: Signal<Vec<UserSummary>>,
+    block_status: Signal<String>,
 ) {
     let _ = chat_outbox.write().take();
     chat_messages.set(Vec::new());
     presence_counts.set(PresenceCounts::default());
     chat_status.set("Connecting to global chat...".to_string());
 
-    let access_token = session.access_token.clone();
-    let expires_in_seconds = session.expires_in_seconds;
+    let session = session.clone();
     let generation = *session_generation.read();
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
     chat_outbox.set(Some(outgoing_tx));
 
     spawn(async move {
         if let Err(error) = run_chat_socket(
-            access_token,
-            expires_in_seconds,
+            session,
             session_generation,
             generation,
             outgoing_rx,
             chat_messages,
             chat_status,
             presence_counts,
+            friendships,
+            friends_status,
+            blocked_users,
+            block_status,
         )
         .await
         {
@@ -2026,18 +2055,21 @@ fn stop_chat_session(
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 async fn run_chat_socket(
-    access_token: String,
-    expires_in_seconds: u64,
+    session: AuthSession,
     session_generation: Signal<u64>,
     generation: u64,
     mut outgoing_rx: UnboundedReceiver<ClientEvent>,
     chat_messages: Signal<Vec<ChatMessage>>,
     mut chat_status: Signal<String>,
     presence_counts: Signal<PresenceCounts>,
+    friendships: Signal<Vec<FriendshipSummary>>,
+    friends_status: Signal<String>,
+    blocked_users: Signal<Vec<UserSummary>>,
+    block_status: Signal<String>,
 ) -> Result<(), String> {
     let mut reconnect_attempt = 0u64;
     let reconnect_until = std::time::Instant::now()
-        + std::time::Duration::from_secs(chat_reconnect_window(expires_in_seconds));
+        + std::time::Duration::from_secs(chat_reconnect_window(session.expires_in_seconds));
 
     while !outgoing_rx.is_closed() {
         if !session_generation_current(session_generation, generation) {
@@ -2049,13 +2081,17 @@ async fn run_chat_socket(
         }
 
         match run_chat_socket_once(
-            &access_token,
+            &session,
             session_generation,
             generation,
             &mut outgoing_rx,
             chat_messages,
             chat_status,
             presence_counts,
+            friendships,
+            friends_status,
+            blocked_users,
+            block_status,
         )
         .await
         {
@@ -2090,13 +2126,17 @@ fn chat_reconnect_window(expires_in_seconds: u64) -> u64 {
 
 #[cfg(windows)]
 async fn run_chat_socket_once(
-    access_token: &str,
+    session: &AuthSession,
     session_generation: Signal<u64>,
     generation: u64,
     outgoing_rx: &mut UnboundedReceiver<ClientEvent>,
     chat_messages: Signal<Vec<ChatMessage>>,
     mut chat_status: Signal<String>,
     presence_counts: Signal<PresenceCounts>,
+    friendships: Signal<Vec<FriendshipSummary>>,
+    friends_status: Signal<String>,
+    blocked_users: Signal<Vec<UserSummary>>,
+    block_status: Signal<String>,
 ) -> Result<(), String> {
     if !session_generation_current(session_generation, generation) {
         return Ok(());
@@ -2105,7 +2145,7 @@ async fn run_chat_socket_once(
     let mut request = websocket_url()
         .into_client_request()
         .map_err(|error| format!("Could not build chat request: {error}"))?;
-    let bearer = format!("Bearer {access_token}");
+    let bearer = format!("Bearer {}", session.access_token);
     let header = HeaderValue::from_str(&bearer)
         .map_err(|error| format!("Could not build chat auth header: {error}"))?;
     request.headers_mut().insert(AUTHORIZATION, header);
@@ -2145,7 +2185,19 @@ async fn run_chat_socket_once(
             incoming = socket_rx.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        handle_chat_event(text.as_str(), session_generation, generation, chat_messages, chat_status, presence_counts);
+                        handle_chat_event(
+                            text.as_str(),
+                            session,
+                            session_generation,
+                            generation,
+                            chat_messages,
+                            chat_status,
+                            presence_counts,
+                            friendships,
+                            friends_status,
+                            blocked_users,
+                            block_status,
+                        );
                     }
                     Some(Ok(Message::Ping(payload))) => socket_tx
                         .send(Message::Pong(payload))
@@ -2163,11 +2215,16 @@ async fn run_chat_socket_once(
 #[cfg(windows)]
 fn handle_chat_event(
     text: &str,
+    session: &AuthSession,
     session_generation: Signal<u64>,
     generation: u64,
     mut chat_messages: Signal<Vec<ChatMessage>>,
     mut chat_status: Signal<String>,
     mut presence_counts: Signal<PresenceCounts>,
+    friendships: Signal<Vec<FriendshipSummary>>,
+    friends_status: Signal<String>,
+    blocked_users: Signal<Vec<UserSummary>>,
+    block_status: Signal<String>,
 ) {
     if !session_generation_current(session_generation, generation) {
         return;
@@ -2189,6 +2246,24 @@ fn handle_chat_event(
                 messages.drain(0..overflow);
             }
         }
+        Ok(ServerEvent::GlobalMessageDeleted { message_id }) => {
+            let mut messages = chat_messages.write();
+            remove_message_by_id(&mut messages, message_id);
+        }
+        Ok(ServerEvent::UserMessagesHidden { user_id }) => {
+            let mut messages = chat_messages.write();
+            remove_blocked_user_messages(&mut messages, user_id);
+        }
+        Ok(ServerEvent::RelationshipStateChanged) => {
+            refresh_relationship_state(
+                session,
+                session_generation,
+                friendships,
+                friends_status,
+                blocked_users,
+                block_status,
+            );
+        }
         Ok(ServerEvent::Error { message }) => chat_status.set(format!("Chat error: {message}")),
         Ok(ServerEvent::MinimumVersionRequired {
             minimum_client_version,
@@ -2196,9 +2271,13 @@ fn handle_chat_event(
             "Client update required. Minimum version: {minimum_client_version}"
         )),
         Ok(ServerEvent::PresenceCounts(counts)) => presence_counts.set(counts),
-        Ok(ServerEvent::DmMessageCreated(_)) => {}
         Err(error) => chat_status.set(format!("Could not read chat event: {error}")),
     }
+}
+
+#[cfg(windows)]
+fn remove_message_by_id(messages: &mut Vec<ChatMessage>, message_id: uuid::Uuid) {
+    messages.retain(|message| message.id != message_id);
 }
 
 #[cfg(windows)]
@@ -2778,6 +2857,7 @@ fn chat_mode_overlay_view(
             {block_report_panel(
                 session,
                 session_generation,
+                chat_messages,
                 friendships,
                 friends_status,
                 blocked_users,
@@ -3145,6 +3225,55 @@ mod relationship_ui_tests {
         assert_eq!(draft.message_kind, Some(MessageKind::Global));
         assert_eq!(draft.message_preview.as_deref(), Some("spam"));
     }
+
+    #[test]
+    fn removes_blocked_user_messages_from_cache() {
+        let blocked = user(2, "Alice");
+        let other = user(3, "Bob");
+        let retained_message = ChatMessage {
+            id: uuid::Uuid::new_v4(),
+            author: other,
+            body: "hello".to_string(),
+            created_at: "2026-09-08 18:15:09".to_string(),
+        };
+        let mut messages = vec![
+            ChatMessage {
+                id: uuid::Uuid::new_v4(),
+                author: blocked.clone(),
+                body: "blocked".to_string(),
+                created_at: "2026-09-08 18:15:09".to_string(),
+            },
+            retained_message.clone(),
+        ];
+
+        remove_blocked_user_messages(&mut messages, blocked.id);
+
+        assert_eq!(messages, vec![retained_message]);
+    }
+
+    #[test]
+    fn removes_deleted_global_message_from_cache() {
+        let deleted_id = uuid::Uuid::new_v4();
+        let retained_message = ChatMessage {
+            id: uuid::Uuid::new_v4(),
+            author: user(3, "Bob"),
+            body: "hello".to_string(),
+            created_at: "2026-09-08 18:15:09".to_string(),
+        };
+        let mut messages = vec![
+            ChatMessage {
+                id: deleted_id,
+                author: user(2, "Alice"),
+                body: "deleted".to_string(),
+                created_at: "2026-09-08 18:15:09".to_string(),
+            },
+            retained_message.clone(),
+        ];
+
+        remove_message_by_id(&mut messages, deleted_id);
+
+        assert_eq!(messages, vec![retained_message]);
+    }
 }
 
 #[cfg(windows)]
@@ -3461,6 +3590,7 @@ fn friendship_row(
 fn block_report_panel(
     session: Option<AuthSession>,
     session_generation: Signal<u64>,
+    chat_messages: Signal<Vec<ChatMessage>>,
     friendships: Signal<Vec<FriendshipSummary>>,
     friends_status: Signal<String>,
     blocked_users: Signal<Vec<UserSummary>>,
@@ -3519,7 +3649,7 @@ fn block_report_panel(
                         "Refresh Blocks"
                     }
                 }
-                p { "Blocks are enforced in global chat history and new broadcasts." }
+                p { "A block is one-way, but it hides global chat communication in both directions." }
                 div { class: "search-row",
                     input {
                         placeholder: "Search users to block or report",
@@ -3617,6 +3747,7 @@ fn block_report_panel(
                                 user,
                                 session.clone(),
                                 session_generation,
+                                chat_messages,
                                 friendships,
                                 friends_status,
                                 blocked_users,
@@ -3651,6 +3782,7 @@ fn block_report_user_row(
     user: UserSummary,
     session: Option<AuthSession>,
     session_generation: Signal<u64>,
+    chat_messages: Signal<Vec<ChatMessage>>,
     friendships: Signal<Vec<FriendshipSummary>>,
     friends_status: Signal<String>,
     blocked_users: Signal<Vec<UserSummary>>,
@@ -3681,6 +3813,7 @@ fn block_report_user_row(
                                 session,
                                 session_generation,
                                 block_target.clone(),
+                                chat_messages,
                                 blocked_users,
                                 block_status,
                                 friendships,

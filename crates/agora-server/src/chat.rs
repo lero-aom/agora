@@ -1,8 +1,8 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{cmp::Ordering, net::SocketAddr, time::Duration};
 
 use agora_common::{
-    ApiError, ChatMessage, ClientEvent, PresenceCounts, PresenceState, ServerEvent, UserSummary,
-    MAX_MESSAGE_LEN, PROTOCOL_VERSION,
+    ApiError, ChatMessage, ClientEvent, PresenceState, ServerEvent, UserSummary, MAX_MESSAGE_LEN,
+    PROTOCOL_VERSION,
 };
 use axum::{
     extract::{
@@ -14,25 +14,100 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
 use sqlx::{postgres::PgRow, Row};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{auth, AppState};
+use crate::{auth, visibility, AppState};
 
 const RECENT_MESSAGE_LIMIT: i64 = 50;
+const HELLO_TIMEOUT_SECONDS: u64 = 10;
+const SESSION_REVALIDATE_SECONDS: u64 = 30;
 
 type WsSender = SplitSink<WebSocket, Message>;
+type WsReceiver = SplitStream<WebSocket>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct RealtimeEvent {
+    audience: RealtimeAudience,
+    payload: RealtimePayload,
+}
+
+#[derive(Debug, Clone)]
+enum RealtimeAudience {
+    Public,
+    User(Uuid),
+    Session(Uuid),
+}
+
+#[derive(Debug, Clone)]
+enum RealtimePayload {
+    Event(ServerEvent),
+    Disconnect { message: String },
+}
+
+enum Delivery {
+    Send(ServerEvent),
+    Disconnect(String),
+    Skip,
+}
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new().route("/ws", get(websocket))
 }
 
-pub(crate) fn broadcast_channel() -> broadcast::Sender<ServerEvent> {
+pub(crate) fn broadcast_channel() -> broadcast::Sender<RealtimeEvent> {
     let (sender, _) = broadcast::channel(256);
     sender
+}
+
+pub(crate) fn send_session_revoked(tx: &broadcast::Sender<RealtimeEvent>, session_id: Uuid) {
+    let _ = tx.send(RealtimeEvent {
+        audience: RealtimeAudience::Session(session_id),
+        payload: RealtimePayload::Disconnect {
+            message: "Chat session ended; sign in again".to_string(),
+        },
+    });
+}
+
+fn send_public_event(tx: &broadcast::Sender<RealtimeEvent>, event: ServerEvent) {
+    let _ = tx.send(RealtimeEvent {
+        audience: RealtimeAudience::Public,
+        payload: RealtimePayload::Event(event),
+    });
+}
+
+pub(crate) fn send_user_event(
+    tx: &broadcast::Sender<RealtimeEvent>,
+    user_id: Uuid,
+    event: ServerEvent,
+) {
+    let _ = tx.send(RealtimeEvent {
+        audience: RealtimeAudience::User(user_id),
+        payload: RealtimePayload::Event(event),
+    });
+}
+
+pub(crate) fn send_user_disconnect(
+    tx: &broadcast::Sender<RealtimeEvent>,
+    user_id: Uuid,
+    message: impl Into<String>,
+) {
+    let _ = tx.send(RealtimeEvent {
+        audience: RealtimeAudience::User(user_id),
+        payload: RealtimePayload::Disconnect {
+            message: message.into(),
+        },
+    });
+}
+
+pub(crate) fn send_global_message_deleted(tx: &broadcast::Sender<RealtimeEvent>, message_id: Uuid) {
+    send_public_event(tx, ServerEvent::GlobalMessageDeleted { message_id });
 }
 
 async fn websocket(
@@ -94,33 +169,35 @@ async fn websocket_session(
     socket: WebSocket,
     session: auth::AuthenticatedSession,
 ) {
-    let user = session.user;
-    let initial_presence = state.presence.connect(user.id).await;
-    let _ = state
-        .chat_tx
-        .send(ServerEvent::PresenceCounts(initial_presence));
+    let user_id = session.user.id;
 
-    websocket_session_inner(
-        state.clone(),
-        socket,
-        user.clone(),
-        initial_presence,
-        session.access_token_ttl_seconds,
-    )
-    .await;
+    if !websocket_session_inner(state.clone(), socket, session).await {
+        return;
+    }
 
-    let presence = state.presence.disconnect(user.id).await;
-    let _ = state.chat_tx.send(ServerEvent::PresenceCounts(presence));
+    let presence = state.presence.disconnect(user_id).await;
+    send_public_event(&state.chat_tx, ServerEvent::PresenceCounts(presence));
 }
 
 async fn websocket_session_inner(
     state: AppState,
     socket: WebSocket,
-    user: UserSummary,
-    initial_presence: PresenceCounts,
-    access_token_ttl_seconds: u64,
-) {
+    session: auth::AuthenticatedSession,
+) -> bool {
     let (mut sender, mut receiver) = socket.split();
+
+    if !receive_hello(&state, &mut sender, &mut receiver).await {
+        return false;
+    }
+    if !ensure_session_active(&state, &mut sender, &session).await {
+        return false;
+    }
+
+    let initial_presence = state.presence.connect(session.user.id).await;
+    send_public_event(
+        &state.chat_tx,
+        ServerEvent::PresenceCounts(initial_presence),
+    );
     let mut broadcast_rx = state.chat_tx.subscribe();
 
     if send_event(
@@ -133,17 +210,17 @@ async fn websocket_session_inner(
     .await
     .is_err()
     {
-        return;
+        return true;
     }
 
-    match recent_global_messages(&state, &user).await {
+    match recent_global_messages(&state, &session.user).await {
         Ok(messages) => {
             for message in messages {
                 if send_event(&mut sender, &ServerEvent::GlobalMessageCreated(message))
                     .await
                     .is_err()
                 {
-                    return;
+                    return true;
                 }
             }
         }
@@ -153,8 +230,11 @@ async fn websocket_session_inner(
         }
     }
 
-    let access_token_expires = tokio::time::sleep(Duration::from_secs(access_token_ttl_seconds));
+    let access_token_expires =
+        tokio::time::sleep(Duration::from_secs(session.access_token_ttl_seconds));
     tokio::pin!(access_token_expires);
+    let mut session_revalidate =
+        tokio::time::interval(Duration::from_secs(SESSION_REVALIDATE_SECONDS));
 
     loop {
         tokio::select! {
@@ -162,9 +242,19 @@ async fn websocket_session_inner(
                 let _ = send_error(&mut sender, "Chat session expired; sign in again").await;
                 break;
             }
+            _ = session_revalidate.tick() => {
+                if !ensure_session_active(&state, &mut sender, &session).await {
+                    break;
+                }
+            }
             incoming = receiver.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(text))) => handle_text_message(&state, &mut sender, &user, text.as_str()).await,
+                    Some(Ok(Message::Text(text))) => {
+                        if !ensure_session_active(&state, &mut sender, &session).await {
+                            break;
+                        }
+                        handle_text_message(&state, &mut sender, &session.user, text.as_str()).await;
+                    }
                     Some(Ok(Message::Ping(payload))) => {
                         if sender.send(Message::Pong(payload)).await.is_err() {
                             break;
@@ -181,11 +271,20 @@ async fn websocket_session_inner(
             broadcast = broadcast_rx.recv() => {
                 match broadcast {
                     Ok(event) => {
-                        if !should_deliver_event(&state, &user, &event).await {
-                            continue;
-                        }
-                        if send_event(&mut sender, &event).await.is_err() {
-                            break;
+                        match event_delivery(&state, &session, &event).await {
+                            Delivery::Send(event) => {
+                                if !ensure_session_active(&state, &mut sender, &session).await {
+                                    break;
+                                }
+                                if send_event(&mut sender, &event).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Delivery::Disconnect(message) => {
+                                let _ = send_error(&mut sender, &message).await;
+                                break;
+                            }
+                            Delivery::Skip => {}
                         }
                     }
                     Err(RecvError::Lagged(skipped)) => {
@@ -194,6 +293,87 @@ async fn websocket_session_inner(
                     Err(RecvError::Closed) => break,
                 }
             }
+        }
+    }
+
+    true
+}
+
+async fn receive_hello(state: &AppState, sender: &mut WsSender, receiver: &mut WsReceiver) -> bool {
+    let timeout = tokio::time::sleep(Duration::from_secs(HELLO_TIMEOUT_SECONDS));
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => {
+                let _ = send_error(sender, "Chat hello timed out").await;
+                return false;
+            }
+            incoming = receiver.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let event = match serde_json::from_str::<ClientEvent>(text.as_str()) {
+                            Ok(event) => event,
+                            Err(error) => {
+                                warn!(%error, "failed to parse client chat hello");
+                                let _ = send_error(sender, "Invalid chat hello").await;
+                                return false;
+                            }
+                        };
+
+                        let ClientEvent::Hello { client_version } = event else {
+                            let _ = send_error(sender, "Chat hello is required").await;
+                            return false;
+                        };
+
+                        if client_version_meets_minimum(
+                            &client_version,
+                            &state.config.minimum_client_version,
+                        ) {
+                            return true;
+                        }
+
+                        let _ = send_event(
+                            sender,
+                            &ServerEvent::MinimumVersionRequired {
+                                minimum_client_version: state.config.minimum_client_version.clone(),
+                            },
+                        )
+                        .await;
+                        return false;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() {
+                            return false;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return false,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        warn!(%error, "WebSocket hello receive failed");
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn ensure_session_active(
+    state: &AppState,
+    sender: &mut WsSender,
+    session: &auth::AuthenticatedSession,
+) -> bool {
+    match auth::session_is_active(state, session.session_id).await {
+        Ok(true) => true,
+        Ok(false) => {
+            let _ = send_error(sender, "Chat session ended; sign in again").await;
+            false
+        }
+        Err(error) => {
+            warn!(%error, "failed to revalidate chat session");
+            let _ = send_error(sender, "Could not validate chat session").await;
+            false
         }
     }
 }
@@ -223,9 +403,10 @@ async fn handle_text_message(
             match normalize_message_body(&body) {
                 Ok(body) => match insert_global_message(state, user, &body).await {
                     Ok(message) => {
-                        let _ = state
-                            .chat_tx
-                            .send(ServerEvent::GlobalMessageCreated(message));
+                        send_public_event(
+                            &state.chat_tx,
+                            ServerEvent::GlobalMessageCreated(message),
+                        );
                     }
                     Err(error) => {
                         warn!(%error, "failed to persist global message");
@@ -241,24 +422,19 @@ async fn handle_text_message(
         ClientEvent::PresenceUpdate { state: presence } => {
             broadcast_presence(state, user.id, presence).await;
         }
-        ClientEvent::DmMessageSend { .. }
-        | ClientEvent::ReportUser { .. }
-        | ClientEvent::ReportMessage { .. } => {
-            let _ = send_error(sender, "That chat action is not implemented yet").await;
-        }
     }
 }
 
 async fn broadcast_presence(state: &AppState, user_id: Uuid, presence: PresenceState) {
     let counts = state.presence.update(user_id, presence).await;
-    let _ = state.chat_tx.send(ServerEvent::PresenceCounts(counts));
+    send_public_event(&state.chat_tx, ServerEvent::PresenceCounts(counts));
 }
 
 async fn recent_global_messages(
     state: &AppState,
     viewer: &UserSummary,
 ) -> Result<Vec<ChatMessage>, sqlx::Error> {
-    let rows = sqlx::query(
+    let sql = format!(
         "select
             m.id,
             m.body,
@@ -269,19 +445,16 @@ async fn recent_global_messages(
          from global_messages m
          join users u on u.id = m.user_id
          where m.deleted_at is null
-           and not exists (
-                select 1
-                from blocks b
-                where (b.blocker_id = $2 and b.blocked_id = m.user_id)
-                   or (b.blocker_id = m.user_id and b.blocked_id = $2)
-           )
+           and {}
          order by m.created_at desc
          limit $1",
-    )
-    .bind(RECENT_MESSAGE_LIMIT)
-    .bind(viewer.id)
-    .fetch_all(&state.db)
-    .await?;
+        visibility::not_blocked_between_sql("$2", "m.user_id")
+    );
+    let rows = sqlx::query(&sql)
+        .bind(RECENT_MESSAGE_LIMIT)
+        .bind(viewer.id)
+        .fetch_all(&state.db)
+        .await?;
 
     let mut messages = rows
         .iter()
@@ -291,42 +464,61 @@ async fn recent_global_messages(
     Ok(messages)
 }
 
-async fn should_deliver_event(state: &AppState, viewer: &UserSummary, event: &ServerEvent) -> bool {
-    let ServerEvent::GlobalMessageCreated(message) = event else {
-        return true;
-    };
-    match can_see_author(state, viewer.id, message.author.id).await {
-        Ok(can_see) => can_see,
-        Err(error) => {
-            warn!(%error, "failed to check chat block relationship");
-            false
+async fn event_delivery(
+    state: &AppState,
+    session: &auth::AuthenticatedSession,
+    event: &RealtimeEvent,
+) -> Delivery {
+    match &event.audience {
+        RealtimeAudience::Public => {
+            public_event_delivery(state, &session.user, &event.payload).await
         }
+        RealtimeAudience::User(user_id) if *user_id == session.user.id => {
+            payload_delivery(&event.payload)
+        }
+        RealtimeAudience::User(_) => Delivery::Skip,
+        RealtimeAudience::Session(session_id) if *session_id == session.session_id => {
+            payload_delivery(&event.payload)
+        }
+        RealtimeAudience::Session(_) => Delivery::Skip,
     }
 }
 
-async fn can_see_author(
+async fn public_event_delivery(
     state: &AppState,
-    viewer_id: Uuid,
-    author_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    if viewer_id == author_id {
-        return Ok(true);
+    viewer: &UserSummary,
+    payload: &RealtimePayload,
+) -> Delivery {
+    let RealtimePayload::Event(event) = payload else {
+        return Delivery::Skip;
+    };
+
+    match event {
+        ServerEvent::PresenceCounts(_) => Delivery::Send(event.clone()),
+        ServerEvent::GlobalMessageDeleted { .. } => Delivery::Send(event.clone()),
+        ServerEvent::GlobalMessageCreated(message) => {
+            match visibility::can_deliver_between(&state.db, viewer.id, message.author.id).await {
+                Ok(true) => Delivery::Send(event.clone()),
+                Ok(false) => Delivery::Skip,
+                Err(error) => {
+                    warn!(%error, "failed to check chat block relationship");
+                    Delivery::Skip
+                }
+            }
+        }
+        ServerEvent::HelloOk { .. }
+        | ServerEvent::MinimumVersionRequired { .. }
+        | ServerEvent::UserMessagesHidden { .. }
+        | ServerEvent::RelationshipStateChanged
+        | ServerEvent::Error { .. } => Delivery::Skip,
     }
+}
 
-    let blocked = sqlx::query_scalar::<_, bool>(
-        "select exists(
-            select 1
-            from blocks
-            where (blocker_id = $1 and blocked_id = $2)
-               or (blocker_id = $2 and blocked_id = $1)
-        )",
-    )
-    .bind(viewer_id)
-    .bind(author_id)
-    .fetch_one(&state.db)
-    .await?;
-
-    Ok(!blocked)
+fn payload_delivery(payload: &RealtimePayload) -> Delivery {
+    match payload {
+        RealtimePayload::Event(event) => Delivery::Send(event.clone()),
+        RealtimePayload::Disconnect { message } => Delivery::Disconnect(message.clone()),
+    }
 }
 
 async fn insert_global_message(
@@ -407,6 +599,59 @@ fn normalize_message_body(body: &str) -> Result<String, &'static str> {
     Ok(body.to_string())
 }
 
+fn client_version_meets_minimum(client_version: &str, minimum_client_version: &str) -> bool {
+    compare_client_versions(client_version, minimum_client_version)
+        .is_some_and(|ordering| ordering != Ordering::Less)
+}
+
+fn compare_client_versions(client_version: &str, minimum_client_version: &str) -> Option<Ordering> {
+    let client = parse_client_version(client_version)?;
+    let minimum = parse_client_version(minimum_client_version)?;
+    Some(client.cmp(&minimum))
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ParsedClientVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    release_rank: u8,
+}
+
+fn parse_client_version(value: &str) -> Option<ParsedClientVersion> {
+    let value = value.trim();
+    let without_build = value
+        .split_once('+')
+        .map(|(version, _)| version)
+        .unwrap_or(value);
+    let (core, release_rank) = match without_build.split_once('-') {
+        Some((core, prerelease)) if !prerelease.is_empty() => (core, 0),
+        Some(_) => return None,
+        None => (without_build, 1),
+    };
+    let mut segments = core.split('.');
+    let major = parse_version_segment(segments.next()?)?;
+    let minor = parse_version_segment(segments.next()?)?;
+    let patch = parse_version_segment(segments.next()?)?;
+    if segments.next().is_some() {
+        return None;
+    }
+
+    Some(ParsedClientVersion {
+        major,
+        minor,
+        patch,
+        release_rank,
+    })
+}
+
+fn parse_version_segment(segment: &str) -> Option<u64> {
+    if segment.is_empty() || !segment.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    segment.parse().ok()
+}
+
 async fn send_error(sender: &mut WsSender, message: &str) -> Result<(), String> {
     send_event(
         sender,
@@ -444,6 +689,21 @@ mod tests {
         let body = "x".repeat(MAX_MESSAGE_LEN + 1);
 
         assert_eq!(normalize_message_body(&body), Err("Message is too long"));
+    }
+
+    #[test]
+    fn compares_client_versions_against_minimum() {
+        assert!(client_version_meets_minimum("0.1.0", "0.1.0"));
+        assert!(client_version_meets_minimum("0.1.1", "0.1.0"));
+        assert!(client_version_meets_minimum("1.0.0", "0.9.9"));
+        assert!(!client_version_meets_minimum("0.0.9", "0.1.0"));
+        assert!(!client_version_meets_minimum("not-a-version", "0.1.0"));
+    }
+
+    #[test]
+    fn treats_prerelease_client_versions_as_older_than_release() {
+        assert!(!client_version_meets_minimum("0.1.0-alpha", "0.1.0"));
+        assert!(client_version_meets_minimum("0.1.0+build.1", "0.1.0"));
     }
 
     #[test]

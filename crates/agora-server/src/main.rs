@@ -19,16 +19,19 @@ use url::Url;
 
 mod auth;
 mod chat;
+mod db_events;
+mod moderation;
 mod presence;
 mod rate_limit;
 mod relationships;
+mod visibility;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) config: Arc<Config>,
     pub(crate) db: PgPool,
     pub(crate) http: reqwest::Client,
-    pub(crate) chat_tx: broadcast::Sender<agora_common::ServerEvent>,
+    pub(crate) chat_tx: broadcast::Sender<chat::RealtimeEvent>,
     pub(crate) presence: Arc<presence::PresenceTracker>,
     pub(crate) rate_limits: Arc<rate_limit::RateLimiters>,
 }
@@ -118,6 +121,7 @@ async fn main() -> Result<()> {
         presence: Arc::new(presence::PresenceTracker::new()),
         rate_limits: Arc::new(rate_limit::RateLimiters::new()),
     };
+    db_events::spawn_database_event_listener(state.clone());
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind {bind_addr}"))?;
@@ -138,6 +142,7 @@ fn app(state: AppState) -> Router {
         .route("/version", get(version))
         .merge(auth::router())
         .merge(chat::router())
+        .merge(moderation::router())
         .merge(relationships::router())
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {

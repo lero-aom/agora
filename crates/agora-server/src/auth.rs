@@ -3,11 +3,11 @@ use std::{collections::HashMap, net::SocketAddr};
 use agora_common::{
     ApiError, AuthSession, DevLoginRequest, DevLoginResponse, LogoutRequest, LogoutResponse,
     RefreshRequest, RefreshResponse, SteamLoginPollRequest, SteamLoginPollResponse,
-    SteamLoginStartResponse, SteamLoginStatus, UserSummary,
+    SteamLoginStartResponse, SteamLoginStatus, UserRole, UserSummary,
 };
 use axum::{
-    extract::{ConnectInfo, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{ConnectInfo, FromRequestParts, Query, State},
+    http::{header, request::Parts, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -22,7 +22,7 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{chat, AppState};
 
 const STEAM_OPENID_ENDPOINT: &str = "https://steamcommunity.com/openid/login";
 const STEAM_IDENTIFIER_SELECT: &str = "http://specs.openid.net/auth/2.0/identifier_select";
@@ -35,8 +35,39 @@ type AuthResult<T> = Result<T, AuthError>;
 
 #[derive(Clone)]
 pub(crate) struct AuthenticatedSession {
+    pub(crate) session_id: Uuid,
     pub(crate) user: UserSummary,
+    pub(crate) role: UserRole,
     pub(crate) access_token_ttl_seconds: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct Principal {
+    #[allow(dead_code)]
+    pub(crate) session_id: Uuid,
+    pub(crate) user: UserSummary,
+    pub(crate) role: UserRole,
+}
+
+impl Principal {
+    pub(crate) fn is_moderator(&self) -> bool {
+        matches!(self.role, UserRole::Moderator | UserRole::Admin)
+    }
+
+    pub(crate) fn is_admin(&self) -> bool {
+        self.role == UserRole::Admin
+    }
+}
+
+impl FromRequestParts<AppState> for Principal {
+    type Rejection = AuthError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        principal_for_headers(state, &parts.headers).await
+    }
 }
 
 pub(crate) fn router() -> Router<AppState> {
@@ -73,9 +104,11 @@ pub(crate) async fn user_for_access_token(
            and u.banned_at is null
            and (u.suspended_until is null or u.suspended_until <= now())
          returning
+            s.id as session_id,
             u.id as user_id,
             u.display_name,
             u.avatar_url,
+            u.role,
             greatest(1, extract(epoch from (s.access_token_expires_at - now()))::bigint) as access_token_ttl_seconds",
     )
     .bind(access_token_hash)
@@ -87,13 +120,61 @@ pub(crate) async fn user_for_access_token(
 
     let ttl: i64 = row.try_get("access_token_ttl_seconds")?;
     Ok(Some(AuthenticatedSession {
+        session_id: row.try_get("session_id")?,
         user: UserSummary {
             id: row.try_get("user_id")?,
             display_name: row.try_get("display_name")?,
             avatar_url: row.try_get("avatar_url")?,
         },
+        role: user_role_from_db(row.try_get::<String, _>("role")?.as_str()),
         access_token_ttl_seconds: ttl.max(1) as u64,
     }))
+}
+
+pub(crate) async fn principal_for_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> AuthResult<Principal> {
+    let access_token =
+        bearer_token(headers).ok_or_else(|| AuthError::unauthorized("missing bearer token"))?;
+    user_for_access_token(state, access_token)
+        .await?
+        .map(|session| Principal {
+            session_id: session.session_id,
+            user: session.user,
+            role: session.role,
+        })
+        .ok_or_else(|| AuthError::unauthorized("session is invalid or expired"))
+}
+
+fn user_role_from_db(value: &str) -> UserRole {
+    match value {
+        "moderator" => UserRole::Moderator,
+        "admin" => UserRole::Admin,
+        _ => UserRole::User,
+    }
+}
+
+pub(crate) async fn session_is_active(
+    state: &AppState,
+    session_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "select exists(
+            select 1
+            from sessions s
+            join users u on u.id = s.user_id
+            where s.id = $1
+              and s.access_token_expires_at > now()
+              and s.revoked_at is null
+              and s.expires_at > now()
+              and u.banned_at is null
+              and (u.suspended_until is null or u.suspended_until <= now())
+        )",
+    )
+    .bind(session_id)
+    .fetch_one(&state.db)
+    .await
 }
 
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -373,17 +454,21 @@ async fn logout(
     }
 
     let refresh_token_hash = token_hash(refresh_token, &state.config.session_secret)?;
-    let result = sqlx::query(
+    let rows = sqlx::query(
         "update sessions
          set revoked_at = now()
-         where refresh_token_hash = $1 and revoked_at is null",
+         where refresh_token_hash = $1 and revoked_at is null
+         returning id",
     )
     .bind(refresh_token_hash)
-    .execute(&state.db)
+    .fetch_all(&state.db)
     .await?;
+    for row in &rows {
+        chat::send_session_revoked(&state.chat_tx, row.try_get("id")?);
+    }
 
     Ok(Json(LogoutResponse {
-        revoked: result.rows_affected() > 0,
+        revoked: !rows.is_empty(),
     }))
 }
 
@@ -1151,7 +1236,7 @@ struct SteamPlayer {
 }
 
 #[derive(Debug)]
-struct AuthError {
+pub(crate) struct AuthError {
     status: StatusCode,
     message: String,
 }
