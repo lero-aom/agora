@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_MESSAGE_LEN: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +193,7 @@ pub enum UserRole {
     User,
     Moderator,
     Admin,
+    Owner,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,10 +331,17 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum ClientEvent {
-    Hello { client_version: String },
+    Hello {
+        client_version: String,
+        protocol_version: u16,
+    },
     Heartbeat,
-    PresenceUpdate { state: PresenceState },
-    GlobalMessageSend { body: String },
+    PresenceUpdate {
+        state: PresenceState,
+    },
+    GlobalMessageSend {
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,7 +354,14 @@ pub enum ServerEvent {
     MinimumVersionRequired {
         minimum_client_version: String,
     },
+    ProtocolIncompatible {
+        required_protocol_version: u16,
+    },
+    AccessTokenExpired,
     PresenceCounts(PresenceCounts),
+    GlobalMessageSnapshot {
+        messages: Vec<ChatMessage>,
+    },
     GlobalMessageCreated(ChatMessage),
     GlobalMessageDeleted {
         message_id: Uuid,

@@ -2,10 +2,11 @@ services:
   proxy:
     image: caddy:2
     environment:
-      AGORA_SITE_ADDRESS: ${AGORA_SITE_ADDRESS:-:80}
+      AGORA_SITE_ADDRESS: ${AGORA_SITE_ADDRESS:-localhost:80}
+      AGORA_DEV_LOGIN_PROXY_TOKEN: ${AGORA_DEV_LOGIN_PROXY_TOKEN:?set AGORA_DEV_LOGIN_PROXY_TOKEN}
     ports:
-      - "80:80"
-      - "443:443"
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -22,11 +23,14 @@ services:
       AGORA_BIND_ADDR: 0.0.0.0:8080
       AGORA_PUBLIC_URL: ${AGORA_PUBLIC_URL:-http://localhost}
       AGORA_ENABLE_DEV_LOGIN: ${AGORA_ENABLE_DEV_LOGIN:?set AGORA_ENABLE_DEV_LOGIN}
-      AGORA_TRUST_PROXY_HEADERS: ${AGORA_TRUST_PROXY_HEADERS:-false}
-      AGORA_MIN_CLIENT_VERSION: ${AGORA_MIN_CLIENT_VERSION:-0.1.0}
+      AGORA_DEV_LOGIN_PROXY_TOKEN: ${AGORA_DEV_LOGIN_PROXY_TOKEN:?set AGORA_DEV_LOGIN_PROXY_TOKEN}
+      AGORA_TRUST_PROXY_HEADERS: "true"
+      AGORA_MIN_CLIENT_VERSION: ${AGORA_MIN_CLIENT_VERSION:-0.4.0}
+      AGORA_REALTIME_MODE: ${AGORA_REALTIME_MODE:-single-replica}
       AGORA_SESSION_SECRET: ${AGORA_SESSION_SECRET:?set AGORA_SESSION_SECRET}
       AGORA_RUN_MIGRATIONS: "true"
-      DATABASE_URL: postgres://agora:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/agora
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      DATABASE_URL: "postgres://agora@postgres:5432/agora"
       STEAM_WEB_API_KEY: ${STEAM_WEB_API_KEY:-}
     depends_on:
       postgres:

@@ -1,6 +1,5 @@
 [CmdletBinding()]
 param(
-    [switch]$SkipChecks,
     [string]$ServerUrl = "https://chat.aomagora.com"
 )
 
@@ -32,10 +31,14 @@ try {
         throw "ServerUrl must be an absolute http(s) URL"
     }
 
-    if (-not $SkipChecks) {
-        Invoke-CargoStep "Checking formatting" { cargo fmt --all -- --check }
-        Invoke-CargoStep "Running clippy" { cargo clippy --workspace --all-targets -- -D warnings }
-        Invoke-CargoStep "Running tests" { cargo test --workspace }
+    Invoke-CargoStep "Checking formatting" { cargo fmt --all -- --check }
+    Invoke-CargoStep "Running clippy" { cargo clippy --locked --workspace --all-targets --all-features -- -D warnings }
+    Invoke-CargoStep "Running unit tests" { cargo test --locked --workspace }
+    if ([string]::IsNullOrWhiteSpace($env:DATABASE_URL)) {
+        throw "DATABASE_URL is required to run PostgreSQL release checks"
+    }
+    Invoke-CargoStep "Running PostgreSQL invariant tests" {
+        cargo test --locked -p agora-server --features postgres-tests --test postgres_invariants
     }
 
     Invoke-CargoStep "Building release server" { cargo build --locked --release -p agora-server }
@@ -72,11 +75,15 @@ try {
     Copy-Item -LiteralPath (Join-Path $RepoRoot "README.md") -Destination (Join-Path $stagingDir "README.md")
 
     Compress-Archive -Path (Join-Path $stagingDir "*") -DestinationPath $archivePath -Force
+    $checksumPath = "$archivePath.sha256"
+    $checksum = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$checksum  $(Split-Path -Leaf $archivePath)" | Set-Content -LiteralPath $checksumPath -NoNewline
 
     ""
     "Release artifacts:"
     "  $stagingDir"
     "  $archivePath"
+    "  $checksumPath"
 }
 finally {
     [Environment]::SetEnvironmentVariable("AGORA_DEFAULT_SERVER_URL", $PreviousDefaultServerUrl, "Process")

@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use agora_common::{
     ApiError, BanUserRequest, DeleteGlobalMessageRequest, MessageKind, ModerationActionKind,
     ModerationActionResponse, ModerationActionSummary, ModerationReasonRequest, ReportDetail,
@@ -7,8 +5,8 @@ use agora_common::{
     SuspendUserRequest, UserRole, UserSummary,
 };
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path, Query, State},
+    http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -41,6 +39,16 @@ struct ReportActionTarget {
     status: ReportStatus,
 }
 
+struct NewModerationAction<'a> {
+    target_user_id: Uuid,
+    action: ModerationActionKind,
+    reason: &'a str,
+    report_id: Option<Uuid>,
+    message_id: Option<Uuid>,
+    message_kind: Option<MessageKind>,
+    expires_from_target: bool,
+}
+
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/staff", get(staff_console))
@@ -63,12 +71,10 @@ async fn staff_console() -> Html<&'static str> {
 
 async fn list_reports(
     State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     principal: auth::Principal,
     Query(query): Query<ReportListQuery>,
 ) -> ModerationResult<Json<ReportListResponse>> {
-    check_staff_read_limit(&state, peer_addr, &headers).await?;
+    check_staff_read_limit(&state, &principal).await?;
     require_moderator(&principal)?;
 
     let status = query.status.map(report_status_as_str);
@@ -89,12 +95,10 @@ async fn list_reports(
 
 async fn get_report(
     State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     principal: auth::Principal,
     Path(report_id): Path<Uuid>,
 ) -> ModerationResult<Json<ReportDetailResponse>> {
-    check_staff_read_limit(&state, peer_addr, &headers).await?;
+    check_staff_read_limit(&state, &principal).await?;
     require_moderator(&principal)?;
 
     Ok(Json(ReportDetailResponse {
@@ -104,13 +108,11 @@ async fn get_report(
 
 async fn resolve_report(
     State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     principal: auth::Principal,
     Path(report_id): Path<Uuid>,
     Json(request): Json<ModerationReasonRequest>,
 ) -> ModerationResult<Json<ReportDetailResponse>> {
-    check_staff_write_limit(&state, peer_addr, &headers).await?;
+    check_staff_write_limit(&state, &principal).await?;
     let report = close_report(
         &state,
         &principal,
@@ -126,13 +128,11 @@ async fn resolve_report(
 
 async fn dismiss_report(
     State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     principal: auth::Principal,
     Path(report_id): Path<Uuid>,
     Json(request): Json<ModerationReasonRequest>,
 ) -> ModerationResult<Json<ReportDetailResponse>> {
-    check_staff_write_limit(&state, peer_addr, &headers).await?;
+    check_staff_write_limit(&state, &principal).await?;
     let report = close_report(
         &state,
         &principal,
@@ -148,38 +148,25 @@ async fn dismiss_report(
 
 async fn delete_global_message(
     State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     principal: auth::Principal,
     Path(message_id): Path<Uuid>,
     Json(request): Json<DeleteGlobalMessageRequest>,
 ) -> ModerationResult<Json<ModerationActionResponse>> {
-    check_staff_write_limit(&state, peer_addr, &headers).await?;
+    check_staff_write_limit(&state, &principal).await?;
     require_moderator(&principal)?;
     let reason = normalize_reason(&request.reason)?;
 
+    let _realtime_state = state.realtime_state_lock.lock().await;
     let mut tx = state.db.begin().await?;
-    let Some(row) = sqlx::query(
-        "select
-            m.user_id,
-            m.deleted_at is not null as already_deleted,
-            u.role as author_role
-         from global_messages m
-         join users u on u.id = m.user_id
-         where m.id = $1
-         for update of m",
-    )
-    .bind(message_id)
-    .fetch_optional(&mut *tx)
-    .await?
+    let Some(target_user_id) =
+        sqlx::query_scalar::<_, Uuid>("select user_id from global_messages where id = $1")
+            .bind(message_id)
+            .fetch_optional(&mut *tx)
+            .await?
     else {
         tx.rollback().await?;
         return Err(ModerationError::not_found("global message was not found"));
     };
-    let target_user_id = row.try_get("user_id")?;
-    let target_role = user_role_from_db(row.try_get::<String, _>("author_role")?.as_str());
-    require_can_moderate_target(&principal, target_role)?;
-
     claim_report_for_action(
         &mut tx,
         request.report_id,
@@ -189,6 +176,31 @@ async fn delete_global_message(
         &principal,
     )
     .await?;
+    let Some(row) = sqlx::query(
+        "select
+            m.user_id,
+            m.deleted_at is not null as already_deleted,
+            u.role as author_role
+         from global_messages m
+         join users u on u.id = m.user_id
+         where m.id = $1
+          for update of m, u",
+    )
+    .bind(message_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.rollback().await?;
+        return Err(ModerationError::not_found("global message was not found"));
+    };
+    if row.try_get::<Uuid, _>("user_id")? != target_user_id {
+        tx.rollback().await?;
+        return Err(ModerationError::conflict(
+            "global message author changed during moderation",
+        ));
+    }
+    let target_role = user_role_from_db(row.try_get::<String, _>("author_role")?.as_str());
+    require_can_moderate_target(&principal, target_role)?;
 
     if !row.try_get::<bool, _>("already_deleted")? {
         sqlx::query(
@@ -205,13 +217,15 @@ async fn delete_global_message(
     let action = insert_moderation_action(
         &mut tx,
         &principal,
-        target_user_id,
-        ModerationActionKind::DeleteGlobalMessage,
-        &reason,
-        request.report_id,
-        Some(message_id),
-        Some(MessageKind::Global),
-        false,
+        NewModerationAction {
+            target_user_id,
+            action: ModerationActionKind::DeleteGlobalMessage,
+            reason: &reason,
+            report_id: request.report_id,
+            message_id: Some(message_id),
+            message_kind: Some(MessageKind::Global),
+            expires_from_target: false,
+        },
     )
     .await?;
     tx.commit().await?;
@@ -225,25 +239,26 @@ async fn delete_global_message(
 
 async fn suspend_user(
     State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     principal: auth::Principal,
     Path(user_id): Path<Uuid>,
     Json(request): Json<SuspendUserRequest>,
 ) -> ModerationResult<Json<ModerationActionResponse>> {
-    check_staff_write_limit(&state, peer_addr, &headers).await?;
+    check_staff_write_limit(&state, &principal).await?;
     require_moderator(&principal)?;
     require_not_self(&principal, user_id)?;
     let reason = normalize_reason(&request.reason)?;
     validate_suspend_duration(request.duration_seconds)?;
 
     let mut tx = state.db.begin().await?;
+    claim_report_for_action(&mut tx, request.report_id, user_id, None, None, &principal).await?;
     let target = user_for_moderation_tx(&mut tx, user_id).await?;
     require_can_moderate_target(&principal, target.role)?;
-    claim_report_for_action(&mut tx, request.report_id, user_id, None, None, &principal).await?;
     sqlx::query(
         "update users
-         set suspended_until = now() + ($2::bigint * interval '1 second')
+         set suspended_until = greatest(
+            coalesce(suspended_until, now()),
+            now() + ($2::bigint * interval '1 second')
+         )
          where id = $1",
     )
     .bind(user_id)
@@ -254,13 +269,15 @@ async fn suspend_user(
     let action = insert_moderation_action(
         &mut tx,
         &principal,
-        user_id,
-        ModerationActionKind::Suspend,
-        &reason,
-        request.report_id,
-        None,
-        None,
-        true,
+        NewModerationAction {
+            target_user_id: user_id,
+            action: ModerationActionKind::Suspend,
+            reason: &reason,
+            report_id: request.report_id,
+            message_id: None,
+            message_kind: None,
+            expires_from_target: true,
+        },
     )
     .await?;
     tx.commit().await?;
@@ -274,20 +291,19 @@ async fn suspend_user(
 
 async fn ban_user(
     State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     principal: auth::Principal,
     Path(user_id): Path<Uuid>,
     Json(request): Json<BanUserRequest>,
 ) -> ModerationResult<Json<ModerationActionResponse>> {
-    check_staff_write_limit(&state, peer_addr, &headers).await?;
+    check_staff_write_limit(&state, &principal).await?;
     require_admin(&principal)?;
     require_not_self(&principal, user_id)?;
     let reason = normalize_reason(&request.reason)?;
 
     let mut tx = state.db.begin().await?;
-    let _ = user_for_moderation_tx(&mut tx, user_id).await?;
     claim_report_for_action(&mut tx, request.report_id, user_id, None, None, &principal).await?;
+    let target = user_for_moderation_tx(&mut tx, user_id).await?;
+    require_can_moderate_target(&principal, target.role)?;
     sqlx::query(
         "update users
          set banned_at = coalesce(banned_at, now()), suspended_until = null
@@ -300,13 +316,15 @@ async fn ban_user(
     let action = insert_moderation_action(
         &mut tx,
         &principal,
-        user_id,
-        ModerationActionKind::Ban,
-        &reason,
-        request.report_id,
-        None,
-        None,
-        false,
+        NewModerationAction {
+            target_user_id: user_id,
+            action: ModerationActionKind::Ban,
+            reason: &reason,
+            report_id: request.report_id,
+            message_id: None,
+            message_kind: None,
+            expires_from_target: false,
+        },
     )
     .await?;
     tx.commit().await?;
@@ -320,19 +338,18 @@ async fn ban_user(
 
 async fn unban_user(
     State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     principal: auth::Principal,
     Path(user_id): Path<Uuid>,
     Json(request): Json<ModerationReasonRequest>,
 ) -> ModerationResult<Json<ModerationActionResponse>> {
-    check_staff_write_limit(&state, peer_addr, &headers).await?;
+    check_staff_write_limit(&state, &principal).await?;
     require_admin(&principal)?;
     require_not_self(&principal, user_id)?;
     let reason = normalize_reason(&request.reason)?;
 
     let mut tx = state.db.begin().await?;
-    let _ = user_for_moderation_tx(&mut tx, user_id).await?;
+    let target = user_for_moderation_tx(&mut tx, user_id).await?;
+    require_can_moderate_target(&principal, target.role)?;
     sqlx::query("update users set banned_at = null where id = $1")
         .bind(user_id)
         .execute(&mut *tx)
@@ -340,13 +357,15 @@ async fn unban_user(
     let action = insert_moderation_action(
         &mut tx,
         &principal,
-        user_id,
-        ModerationActionKind::Unban,
-        &reason,
-        None,
-        None,
-        None,
-        false,
+        NewModerationAction {
+            target_user_id: user_id,
+            action: ModerationActionKind::Unban,
+            reason: &reason,
+            report_id: None,
+            message_id: None,
+            message_kind: None,
+            expires_from_target: false,
+        },
     )
     .await?;
     tx.commit().await?;
@@ -373,6 +392,9 @@ async fn close_report(
         tx.rollback().await?;
         return Err(ModerationError::conflict("report is not open"));
     }
+    require_not_self(principal, report.reported_user_id)?;
+    let target = user_for_moderation_tx(&mut tx, report.reported_user_id).await?;
+    require_can_close_report(principal, target.role)?;
 
     sqlx::query(
         "update reports
@@ -387,13 +409,15 @@ async fn close_report(
     insert_moderation_action(
         &mut tx,
         principal,
-        report.reported_user_id,
-        action,
-        &reason,
-        Some(report_id),
-        report.message_id,
-        report.message_kind,
-        false,
+        NewModerationAction {
+            target_user_id: report.reported_user_id,
+            action,
+            reason: &reason,
+            report_id: Some(report_id),
+            message_id: report.message_id,
+            message_kind: report.message_kind,
+            expires_from_target: false,
+        },
     )
     .await?;
     tx.commit().await?;
@@ -564,15 +588,9 @@ async fn moderation_actions_for_report(
 async fn insert_moderation_action(
     tx: &mut Transaction<'_, Postgres>,
     principal: &auth::Principal,
-    target_user_id: Uuid,
-    action: ModerationActionKind,
-    reason: &str,
-    report_id: Option<Uuid>,
-    message_id: Option<Uuid>,
-    message_kind: Option<MessageKind>,
-    expires_from_target: bool,
+    action: NewModerationAction<'_>,
 ) -> ModerationResult<ModerationActionSummary> {
-    let expires_at_sql = if expires_from_target {
+    let expires_at_sql = if action.expires_from_target {
         "(select suspended_until from users where id = $2)"
     } else {
         "null"
@@ -592,12 +610,12 @@ async fn insert_moderation_action(
     );
     let row = sqlx::query(&sql)
         .bind(principal.user.id)
-        .bind(target_user_id)
-        .bind(moderation_action_as_str(action))
-        .bind(reason)
-        .bind(report_id)
-        .bind(message_id)
-        .bind(message_kind.map(message_kind_as_str))
+        .bind(action.target_user_id)
+        .bind(moderation_action_as_str(action.action))
+        .bind(action.reason)
+        .bind(action.report_id)
+        .bind(action.message_id)
+        .bind(action.message_kind.map(message_kind_as_str))
         .fetch_one(&mut **tx)
         .await?;
     moderation_action_by_id_tx(tx, row.try_get("id")?).await
@@ -664,24 +682,22 @@ fn send_session_revocations(state: &AppState, session_ids: &[Uuid]) {
 
 async fn check_staff_read_limit(
     state: &AppState,
-    peer_addr: SocketAddr,
-    headers: &HeaderMap,
+    principal: &auth::Principal,
 ) -> ModerationResult<()> {
     state
         .rate_limits
-        .check_relationship_read(peer_addr, headers, state.config.trust_proxy_headers)
+        .check_staff_read(principal.user.id)
         .await
         .map_err(|error| ModerationError::too_many_requests(error.message()))
 }
 
 async fn check_staff_write_limit(
     state: &AppState,
-    peer_addr: SocketAddr,
-    headers: &HeaderMap,
+    principal: &auth::Principal,
 ) -> ModerationResult<()> {
     state
         .rate_limits
-        .check_relationship_write(peer_addr, headers, state.config.trust_proxy_headers)
+        .check_staff_write(principal.user.id)
         .await
         .map_err(|error| ModerationError::too_many_requests(error.message()))
 }
@@ -714,14 +730,33 @@ fn require_can_moderate_target(
     principal: &auth::Principal,
     target_role: UserRole,
 ) -> ModerationResult<()> {
-    if principal.is_admin()
-        || (principal.role == UserRole::Moderator && target_role == UserRole::User)
-    {
-        Ok(())
-    } else {
-        Err(ModerationError::forbidden(
+    match (principal.role, target_role) {
+        (UserRole::Owner, UserRole::User | UserRole::Moderator | UserRole::Admin)
+        | (UserRole::Admin, UserRole::User | UserRole::Moderator)
+        | (UserRole::Moderator, UserRole::User) => Ok(()),
+        (UserRole::Owner, UserRole::Owner) => Err(ModerationError::forbidden(
+            "owners cannot moderate peer owners through this API",
+        )),
+        (UserRole::Admin, UserRole::Admin | UserRole::Owner) => Err(ModerationError::forbidden(
+            "admins cannot moderate admins or owners through this API",
+        )),
+        _ => Err(ModerationError::forbidden(
             "moderators can only act on regular users",
-        ))
+        )),
+    }
+}
+
+fn require_can_close_report(
+    principal: &auth::Principal,
+    target_role: UserRole,
+) -> ModerationResult<()> {
+    match (principal.role, target_role) {
+        (UserRole::Owner, _)
+        | (UserRole::Admin, UserRole::User | UserRole::Moderator)
+        | (UserRole::Moderator, UserRole::User) => Ok(()),
+        _ => Err(ModerationError::forbidden(
+            "moderators can only close reports against regular users",
+        )),
     }
 }
 
@@ -865,6 +900,7 @@ fn user_role_from_db(value: &str) -> UserRole {
     match value {
         "moderator" => UserRole::Moderator,
         "admin" => UserRole::Admin,
+        "owner" => UserRole::Owner,
         _ => UserRole::User,
     }
 }
@@ -1061,7 +1097,7 @@ code { color: var(--accent); word-break: break-all; }
 </main>
 
 <script>
-const state = { token: localStorage.getItem("agora_staff_token") || "", reports: [], selected: null };
+const state = { token: sessionStorage.getItem("agora_staff_token") || "", reports: [], selected: null };
 const tokenInput = document.querySelector("#token");
 const statusFilter = document.querySelector("#statusFilter");
 const statusEl = document.querySelector("#status");
@@ -1207,7 +1243,7 @@ async function postAction(path, body, reportId) {
 }
 document.querySelector("#saveToken").addEventListener("click", () => {
   state.token = tokenInput.value.trim();
-  localStorage.setItem("agora_staff_token", state.token);
+  sessionStorage.setItem("agora_staff_token", state.token);
   loadReports();
 });
 document.querySelector("#reload").addEventListener("click", loadReports);
@@ -1302,12 +1338,14 @@ mod tests {
     fn requires_moderator_for_staff_access() {
         assert!(require_moderator(&principal(UserRole::Moderator)).is_ok());
         assert!(require_moderator(&principal(UserRole::Admin)).is_ok());
+        assert!(require_moderator(&principal(UserRole::Owner)).is_ok());
         assert!(require_moderator(&principal(UserRole::User)).is_err());
     }
 
     #[test]
     fn reserves_admin_actions_for_admins() {
         assert!(require_admin(&principal(UserRole::Admin)).is_ok());
+        assert!(require_admin(&principal(UserRole::Owner)).is_ok());
         assert!(require_admin(&principal(UserRole::Moderator)).is_err());
     }
 
@@ -1318,6 +1356,32 @@ mod tests {
         assert!(require_can_moderate_target(&moderator, UserRole::User).is_ok());
         assert!(require_can_moderate_target(&moderator, UserRole::Moderator).is_err());
         assert!(require_can_moderate_target(&moderator, UserRole::Admin).is_err());
+    }
+
+    #[test]
+    fn admins_cannot_act_on_peer_admins() {
+        let admin = principal(UserRole::Admin);
+
+        assert!(require_can_moderate_target(&admin, UserRole::User).is_ok());
+        assert!(require_can_moderate_target(&admin, UserRole::Moderator).is_ok());
+        assert!(require_can_moderate_target(&admin, UserRole::Admin).is_err());
+        assert!(require_can_moderate_target(&admin, UserRole::Owner).is_err());
+    }
+
+    #[test]
+    fn owners_can_escalate_admin_reports_without_sanctioning_owners() {
+        let owner = principal(UserRole::Owner);
+
+        assert!(require_can_moderate_target(&owner, UserRole::Admin).is_ok());
+        assert!(require_can_moderate_target(&owner, UserRole::Owner).is_err());
+        assert!(require_can_close_report(&owner, UserRole::Owner).is_ok());
+    }
+
+    #[test]
+    fn staff_cannot_close_reports_against_themselves() {
+        let staff = principal(UserRole::Admin);
+
+        assert!(require_not_self(&staff, staff.user.id).is_err());
     }
 
     #[test]

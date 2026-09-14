@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agora-client"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "agora-common",
  "dioxus",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "agora-common"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "uuid",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "agora-server"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "agora-common",
  "anyhow",

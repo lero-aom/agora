@@ -49,13 +49,23 @@ pub(crate) struct Principal {
     pub(crate) role: UserRole,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionActivity {
+    Active,
+    AccessTokenExpired,
+    Ended,
+}
+
 impl Principal {
     pub(crate) fn is_moderator(&self) -> bool {
-        matches!(self.role, UserRole::Moderator | UserRole::Admin)
+        matches!(
+            self.role,
+            UserRole::Moderator | UserRole::Admin | UserRole::Owner
+        )
     }
 
     pub(crate) fn is_admin(&self) -> bool {
-        self.role == UserRole::Admin
+        matches!(self.role, UserRole::Admin | UserRole::Owner)
     }
 }
 
@@ -66,6 +76,16 @@ impl FromRequestParts<AppState> for Principal {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let peer_addr = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|value| value.0)
+            .ok_or_else(|| AuthError::internal("missing client connection details"))?;
+        state
+            .rate_limits
+            .check_auth(peer_addr, &parts.headers, state.config.trust_proxy_headers)
+            .await
+            .map_err(|error| AuthError::too_many_requests(error.message()))?;
         principal_for_headers(state, &parts.headers).await
     }
 }
@@ -151,30 +171,40 @@ fn user_role_from_db(value: &str) -> UserRole {
     match value {
         "moderator" => UserRole::Moderator,
         "admin" => UserRole::Admin,
+        "owner" => UserRole::Owner,
         _ => UserRole::User,
     }
 }
 
-pub(crate) async fn session_is_active(
+pub(crate) async fn session_activity(
     state: &AppState,
     session_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(
-        "select exists(
-            select 1
-            from sessions s
-            join users u on u.id = s.user_id
-            where s.id = $1
-              and s.access_token_expires_at > now()
-              and s.revoked_at is null
+) -> Result<SessionActivity, sqlx::Error> {
+    let Some((access_token_active, session_active)) = sqlx::query_as::<_, (bool, bool)>(
+        "select
+            s.access_token_expires_at > now() as access_token_active,
+            s.revoked_at is null
               and s.expires_at > now()
               and u.banned_at is null
-              and (u.suspended_until is null or u.suspended_until <= now())
-        )",
+              and (u.suspended_until is null or u.suspended_until <= now()) as session_active
+         from sessions s
+         join users u on u.id = s.user_id
+         where s.id = $1",
     )
     .bind(session_id)
-    .fetch_one(&state.db)
-    .await
+    .fetch_optional(&state.db)
+    .await?
+    else {
+        return Ok(SessionActivity::Ended);
+    };
+
+    Ok(if !session_active {
+        SessionActivity::Ended
+    } else if !access_token_active {
+        SessionActivity::AccessTokenExpired
+    } else {
+        SessionActivity::Active
+    })
 }
 
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -194,11 +224,13 @@ async fn dev_login(
     headers: HeaderMap,
     request: Option<Json<DevLoginRequest>>,
 ) -> AuthResult<Json<DevLoginResponse>> {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !state.config.enable_dev_login || !is_loopback_host(host) {
+    if !state.config.enable_dev_login
+        || !is_local_dev_login_request(
+            peer_addr,
+            &headers,
+            state.config.dev_login_proxy_token.as_deref(),
+        )
+    {
         return Err(AuthError::not_found("dev login is not enabled"));
     }
     state
@@ -1144,18 +1176,6 @@ strong {{ color: var(--aom-text); }}
     )
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim();
-    let host = if let Some(rest) = host.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
-    } else if host == "::1" {
-        host
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
-}
-
 fn should_send_openid_realm(public_url: &str) -> bool {
     let Ok(url) = Url::parse(public_url) else {
         return false;
@@ -1165,6 +1185,20 @@ fn should_send_openid_realm(public_url: &str) -> bool {
         Some(_) => true,
         None => false,
     }
+}
+
+fn is_local_dev_login_request(
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+    proxy_token: Option<&str>,
+) -> bool {
+    peer_addr.ip().is_loopback()
+        || proxy_token.is_some_and(|token| {
+            headers
+                .get("x-agora-dev-login-proxy")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value == token)
+        })
 }
 
 fn random_token() -> String {
@@ -1422,12 +1456,42 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_loopback_hosts() {
-        assert!(is_loopback_host("localhost"));
-        assert!(is_loopback_host("localhost:8080"));
-        assert!(is_loopback_host("127.0.0.1:80"));
-        assert!(is_loopback_host("[::1]:8080"));
-        assert!(!is_loopback_host("agora.example"));
+    fn owner_has_admin_capabilities() {
+        let principal = Principal {
+            session_id: Uuid::nil(),
+            user: UserSummary {
+                id: Uuid::nil(),
+                display_name: "Owner".to_string(),
+                avatar_url: None,
+            },
+            role: UserRole::Owner,
+        };
+
+        assert!(principal.is_moderator());
+        assert!(principal.is_admin());
+    }
+
+    #[test]
+    fn allows_dev_login_only_from_loopback_or_authenticated_proxy() {
+        let headers = HeaderMap::new();
+        assert!(is_local_dev_login_request(
+            "127.0.0.1:8080".parse().unwrap(),
+            &headers,
+            None
+        ));
+        assert!(!is_local_dev_login_request(
+            "10.0.0.2:8080".parse().unwrap(),
+            &headers,
+            Some("secret")
+        ));
+
+        let mut proxy_headers = HeaderMap::new();
+        proxy_headers.insert("x-agora-dev-login-proxy", "secret".parse().unwrap());
+        assert!(is_local_dev_login_request(
+            "10.0.0.2:8080".parse().unwrap(),
+            &proxy_headers,
+            Some("secret")
+        ));
     }
 
     #[test]

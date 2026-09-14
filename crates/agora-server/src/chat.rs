@@ -1,4 +1,10 @@
-use std::{cmp::Ordering, net::SocketAddr, time::Duration};
+use std::{
+    cmp::Ordering,
+    collections::HashSet,
+    net::SocketAddr,
+    sync::{atomic::Ordering as AtomicOrdering, Arc},
+    time::Duration,
+};
 
 use agora_common::{
     ApiError, ChatMessage, ClientEvent, PresenceState, ServerEvent, UserSummary, MAX_MESSAGE_LEN,
@@ -18,6 +24,7 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
+use serde::Deserialize;
 use sqlx::{postgres::PgRow, Row};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tracing::warn;
@@ -28,6 +35,7 @@ use crate::{auth, visibility, AppState};
 const RECENT_MESSAGE_LIMIT: i64 = 50;
 const HELLO_TIMEOUT_SECONDS: u64 = 10;
 const SESSION_REVALIDATE_SECONDS: u64 = 30;
+const MAX_CACHED_HIDDEN_VIEWERS: usize = 1_024;
 
 type WsSender = SplitSink<WebSocket, Message>;
 type WsReceiver = SplitStream<WebSocket>;
@@ -48,13 +56,33 @@ enum RealtimeAudience {
 #[derive(Debug, Clone)]
 enum RealtimePayload {
     Event(ServerEvent),
-    Disconnect { message: String },
+    GlobalMessageCreated {
+        message: ChatMessage,
+        hidden_viewer_ids: Option<Arc<HashSet<Uuid>>>,
+        visibility_epoch: u64,
+    },
+    Disconnect {
+        message: String,
+    },
 }
 
 enum Delivery {
     Send(ServerEvent),
     Disconnect(String),
     Skip,
+}
+
+#[derive(Deserialize)]
+struct ClientHelloEnvelope {
+    #[serde(rename = "type")]
+    event_type: String,
+    payload: Option<ClientHelloPayload>,
+}
+
+#[derive(Deserialize)]
+struct ClientHelloPayload {
+    client_version: Option<String>,
+    protocol_version: Option<u16>,
 }
 
 pub(crate) fn router() -> Router<AppState> {
@@ -108,6 +136,41 @@ pub(crate) fn send_user_disconnect(
 
 pub(crate) fn send_global_message_deleted(tx: &broadcast::Sender<RealtimeEvent>, message_id: Uuid) {
     send_public_event(tx, ServerEvent::GlobalMessageDeleted { message_id });
+}
+
+pub(crate) async fn send_user_global_snapshot_locked(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let messages = recent_global_messages(state, user_id).await?;
+    send_user_event(
+        &state.chat_tx,
+        user_id,
+        ServerEvent::GlobalMessageSnapshot { messages },
+    );
+    Ok(())
+}
+
+async fn send_global_message_created_locked(state: &AppState, message: ChatMessage) {
+    let visibility_epoch = state.visibility_epoch.load(AtomicOrdering::Acquire);
+    let hidden_viewer_ids = match hidden_viewer_ids_for_author(&state.db, message.author.id).await {
+        Ok(hidden_viewer_ids) if hidden_viewer_ids.len() <= MAX_CACHED_HIDDEN_VIEWERS => {
+            Some(Arc::new(hidden_viewer_ids))
+        }
+        Ok(_) => None,
+        Err(error) => {
+            warn!(%error, "failed to cache global message visibility; using per-recipient checks");
+            None
+        }
+    };
+    let _ = state.chat_tx.send(RealtimeEvent {
+        audience: RealtimeAudience::Public,
+        payload: RealtimePayload::GlobalMessageCreated {
+            message,
+            hidden_viewer_ids,
+            visibility_epoch,
+        },
+    });
 }
 
 async fn websocket(
@@ -198,8 +261,6 @@ async fn websocket_session_inner(
         &state.chat_tx,
         ServerEvent::PresenceCounts(initial_presence),
     );
-    let mut broadcast_rx = state.chat_tx.subscribe();
-
     if send_event(
         &mut sender,
         &ServerEvent::HelloOk {
@@ -213,22 +274,14 @@ async fn websocket_session_inner(
         return true;
     }
 
-    match recent_global_messages(&state, &session.user).await {
-        Ok(messages) => {
-            for message in messages {
-                if send_event(&mut sender, &ServerEvent::GlobalMessageCreated(message))
-                    .await
-                    .is_err()
-                {
-                    return true;
-                }
-            }
-        }
+    let mut broadcast_rx = match subscribe_with_global_snapshot(&state, &session).await {
+        Ok(receiver) => receiver,
         Err(error) => {
             warn!(%error, "failed to load recent global messages");
             let _ = send_error(&mut sender, "Could not load recent chat history").await;
+            return true;
         }
-    }
+    };
 
     let access_token_expires =
         tokio::time::sleep(Duration::from_secs(session.access_token_ttl_seconds));
@@ -239,7 +292,7 @@ async fn websocket_session_inner(
     loop {
         tokio::select! {
             _ = &mut access_token_expires => {
-                let _ = send_error(&mut sender, "Chat session expired; sign in again").await;
+                let _ = send_event(&mut sender, &ServerEvent::AccessTokenExpired).await;
                 break;
             }
             _ = session_revalidate.tick() => {
@@ -250,12 +303,20 @@ async fn websocket_session_inner(
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
+                        if let Err(error) = state.rate_limits.check_chat_event(session.user.id).await {
+                            let _ = send_error(&mut sender, &error.message()).await;
+                            break;
+                        }
                         if !ensure_session_active(&state, &mut sender, &session).await {
                             break;
                         }
                         handle_text_message(&state, &mut sender, &session.user, text.as_str()).await;
                     }
                     Some(Ok(Message::Ping(payload))) => {
+                        if let Err(error) = state.rate_limits.check_chat_event(session.user.id).await {
+                            let _ = send_error(&mut sender, &error.message()).await;
+                            break;
+                        }
                         if sender.send(Message::Pong(payload)).await.is_err() {
                             break;
                         }
@@ -289,6 +350,27 @@ async fn websocket_session_inner(
                     }
                     Err(RecvError::Lagged(skipped)) => {
                         warn!(skipped, "chat client lagged behind broadcast stream");
+                        if !ensure_session_active(&state, &mut sender, &session).await {
+                            break;
+                        }
+                        broadcast_rx = match subscribe_with_global_snapshot(&state, &session).await {
+                            Ok(receiver) => receiver,
+                            Err(error) => {
+                                warn!(%error, "failed to reload recent global messages after broadcast lag");
+                                let _ = send_error(&mut sender, "Could not load recent chat history").await;
+                                break;
+                            }
+                        };
+                        if send_event(&mut sender, &ServerEvent::RelationshipStateChanged).await.is_err()
+                            || send_event(
+                                &mut sender,
+                                &ServerEvent::PresenceCounts(state.presence.counts().await),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     Err(RecvError::Closed) => break,
                 }
@@ -312,8 +394,8 @@ async fn receive_hello(state: &AppState, sender: &mut WsSender, receiver: &mut W
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        let event = match serde_json::from_str::<ClientEvent>(text.as_str()) {
-                            Ok(event) => event,
+                        let hello = match parse_client_hello(text.as_str()) {
+                            Ok(hello) => hello,
                             Err(error) => {
                                 warn!(%error, "failed to parse client chat hello");
                                 let _ = send_error(sender, "Invalid chat hello").await;
@@ -321,13 +403,26 @@ async fn receive_hello(state: &AppState, sender: &mut WsSender, receiver: &mut W
                             }
                         };
 
-                        let ClientEvent::Hello { client_version } = event else {
-                            let _ = send_error(sender, "Chat hello is required").await;
+                        if hello.protocol_version != Some(PROTOCOL_VERSION) {
+                            let _ = send_event(
+                                sender,
+                                &ServerEvent::MinimumVersionRequired {
+                                    minimum_client_version: state.config.minimum_client_version.clone(),
+                                },
+                            )
+                            .await;
+                            let _ = send_event(
+                                sender,
+                                &ServerEvent::ProtocolIncompatible {
+                                    required_protocol_version: PROTOCOL_VERSION,
+                                },
+                            )
+                            .await;
                             return false;
-                        };
+                        }
 
                         if client_version_meets_minimum(
-                            &client_version,
+                            hello.client_version.as_deref().unwrap_or_default(),
                             &state.config.minimum_client_version,
                         ) {
                             return true;
@@ -364,9 +459,13 @@ async fn ensure_session_active(
     sender: &mut WsSender,
     session: &auth::AuthenticatedSession,
 ) -> bool {
-    match auth::session_is_active(state, session.session_id).await {
-        Ok(true) => true,
-        Ok(false) => {
+    match auth::session_activity(state, session.session_id).await {
+        Ok(auth::SessionActivity::Active) => true,
+        Ok(auth::SessionActivity::AccessTokenExpired) => {
+            let _ = send_event(sender, &ServerEvent::AccessTokenExpired).await;
+            false
+        }
+        Ok(auth::SessionActivity::Ended) => {
             let _ = send_error(sender, "Chat session ended; sign in again").await;
             false
         }
@@ -401,18 +500,24 @@ async fn handle_text_message(
             }
 
             match normalize_message_body(&body) {
-                Ok(body) => match insert_global_message(state, user, &body).await {
-                    Ok(message) => {
-                        send_public_event(
-                            &state.chat_tx,
-                            ServerEvent::GlobalMessageCreated(message),
-                        );
+                Ok(body) => {
+                    let error_message = {
+                        let _realtime_state = state.realtime_state_lock.lock().await;
+                        match insert_global_message(state, user, &body).await {
+                            Ok(message) => {
+                                send_global_message_created_locked(state, message).await;
+                                None
+                            }
+                            Err(error) => {
+                                warn!(%error, "failed to persist global message");
+                                Some("Could not save chat message")
+                            }
+                        }
+                    };
+                    if let Some(error_message) = error_message {
+                        let _ = send_error(sender, error_message).await;
                     }
-                    Err(error) => {
-                        warn!(%error, "failed to persist global message");
-                        let _ = send_error(sender, "Could not save chat message").await;
-                    }
-                },
+                }
                 Err(message) => {
                     let _ = send_error(sender, message).await;
                 }
@@ -420,6 +525,10 @@ async fn handle_text_message(
         }
         ClientEvent::Hello { .. } | ClientEvent::Heartbeat => {}
         ClientEvent::PresenceUpdate { state: presence } => {
+            if let Err(error) = state.rate_limits.check_presence_update(user.id).await {
+                let _ = send_error(sender, &error.message()).await;
+                return;
+            }
             broadcast_presence(state, user.id, presence).await;
         }
     }
@@ -432,7 +541,7 @@ async fn broadcast_presence(state: &AppState, user_id: Uuid, presence: PresenceS
 
 async fn recent_global_messages(
     state: &AppState,
-    viewer: &UserSummary,
+    viewer_id: Uuid,
 ) -> Result<Vec<ChatMessage>, sqlx::Error> {
     let sql = format!(
         "select
@@ -452,7 +561,7 @@ async fn recent_global_messages(
     );
     let rows = sqlx::query(&sql)
         .bind(RECENT_MESSAGE_LIMIT)
-        .bind(viewer.id)
+        .bind(viewer_id)
         .fetch_all(&state.db)
         .await?;
 
@@ -462,6 +571,40 @@ async fn recent_global_messages(
         .collect::<Result<Vec<_>, _>>()?;
     messages.reverse();
     Ok(messages)
+}
+
+async fn subscribe_with_global_snapshot(
+    state: &AppState,
+    session: &auth::AuthenticatedSession,
+) -> Result<broadcast::Receiver<RealtimeEvent>, sqlx::Error> {
+    let _realtime_state = state.realtime_state_lock.lock().await;
+    let messages = recent_global_messages(state, session.user.id).await?;
+    let receiver = state.chat_tx.subscribe();
+    let _ = state.chat_tx.send(RealtimeEvent {
+        audience: RealtimeAudience::Session(session.session_id),
+        payload: RealtimePayload::Event(ServerEvent::GlobalMessageSnapshot { messages }),
+    });
+    Ok(receiver)
+}
+
+async fn hidden_viewer_ids_for_author(
+    db: &sqlx::PgPool,
+    author_id: Uuid,
+) -> Result<HashSet<Uuid>, sqlx::Error> {
+    let viewer_ids = sqlx::query_scalar::<_, Uuid>(
+        "select distinct case
+             when blocker_id = $1 then blocked_id
+             else blocker_id
+         end
+         from blocks
+         where blocker_id = $1 or blocked_id = $1
+         limit $2",
+    )
+    .bind(author_id)
+    .bind((MAX_CACHED_HIDDEN_VIEWERS + 1) as i64)
+    .fetch_all(db)
+    .await?;
+    Ok(viewer_ids.into_iter().collect())
 }
 
 async fn event_delivery(
@@ -489,34 +632,54 @@ async fn public_event_delivery(
     viewer: &UserSummary,
     payload: &RealtimePayload,
 ) -> Delivery {
-    let RealtimePayload::Event(event) = payload else {
-        return Delivery::Skip;
-    };
-
-    match event {
-        ServerEvent::PresenceCounts(_) => Delivery::Send(event.clone()),
-        ServerEvent::GlobalMessageDeleted { .. } => Delivery::Send(event.clone()),
-        ServerEvent::GlobalMessageCreated(message) => {
+    match payload {
+        RealtimePayload::GlobalMessageCreated {
+            message,
+            hidden_viewer_ids,
+            visibility_epoch,
+        } => {
+            if *visibility_epoch == state.visibility_epoch.load(AtomicOrdering::Acquire) {
+                if let Some(hidden_viewer_ids) = hidden_viewer_ids {
+                    return if hidden_viewer_ids.contains(&viewer.id) {
+                        Delivery::Skip
+                    } else {
+                        Delivery::Send(ServerEvent::GlobalMessageCreated(message.clone()))
+                    };
+                }
+            }
             match visibility::can_deliver_between(&state.db, viewer.id, message.author.id).await {
-                Ok(true) => Delivery::Send(event.clone()),
+                Ok(true) => Delivery::Send(ServerEvent::GlobalMessageCreated(message.clone())),
                 Ok(false) => Delivery::Skip,
                 Err(error) => {
-                    warn!(%error, "failed to check chat block relationship");
+                    warn!(%error, "failed to revalidate chat block relationship");
                     Delivery::Skip
                 }
             }
         }
-        ServerEvent::HelloOk { .. }
-        | ServerEvent::MinimumVersionRequired { .. }
-        | ServerEvent::UserMessagesHidden { .. }
-        | ServerEvent::RelationshipStateChanged
-        | ServerEvent::Error { .. } => Delivery::Skip,
+        RealtimePayload::Event(
+            ServerEvent::PresenceCounts(_) | ServerEvent::GlobalMessageDeleted { .. },
+        ) => payload_delivery(payload),
+        RealtimePayload::Event(
+            ServerEvent::HelloOk { .. }
+            | ServerEvent::MinimumVersionRequired { .. }
+            | ServerEvent::ProtocolIncompatible { .. }
+            | ServerEvent::AccessTokenExpired
+            | ServerEvent::GlobalMessageSnapshot { .. }
+            | ServerEvent::GlobalMessageCreated(_)
+            | ServerEvent::UserMessagesHidden { .. }
+            | ServerEvent::RelationshipStateChanged
+            | ServerEvent::Error { .. },
+        )
+        | RealtimePayload::Disconnect { .. } => Delivery::Skip,
     }
 }
 
 fn payload_delivery(payload: &RealtimePayload) -> Delivery {
     match payload {
         RealtimePayload::Event(event) => Delivery::Send(event.clone()),
+        RealtimePayload::GlobalMessageCreated { message, .. } => {
+            Delivery::Send(ServerEvent::GlobalMessageCreated(message.clone()))
+        }
         RealtimePayload::Disconnect { message } => Delivery::Disconnect(message.clone()),
     }
 }
@@ -597,6 +760,14 @@ fn normalize_message_body(body: &str) -> Result<String, &'static str> {
         return Err("Message is too long");
     }
     Ok(body.to_string())
+}
+
+fn parse_client_hello(text: &str) -> Result<ClientHelloPayload, &'static str> {
+    let envelope = serde_json::from_str::<ClientHelloEnvelope>(text).map_err(|_| "invalid json")?;
+    if envelope.event_type != "hello" {
+        return Err("not hello");
+    }
+    envelope.payload.ok_or("missing payload")
 }
 
 fn client_version_meets_minimum(client_version: &str, minimum_client_version: &str) -> bool {
@@ -704,6 +875,26 @@ mod tests {
     fn treats_prerelease_client_versions_as_older_than_release() {
         assert!(!client_version_meets_minimum("0.1.0-alpha", "0.1.0"));
         assert!(client_version_meets_minimum("0.1.0+build.1", "0.1.0"));
+    }
+
+    #[test]
+    fn parses_protocol_version_from_client_hello() {
+        let hello = parse_client_hello(
+            r#"{"type":"hello","payload":{"client_version":"0.4.0","protocol_version":4}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(hello.client_version.as_deref(), Some("0.4.0"));
+        assert_eq!(hello.protocol_version, Some(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn accepts_legacy_hello_for_terminal_version_response() {
+        let hello =
+            parse_client_hello(r#"{"type":"hello","payload":{"client_version":"0.1.0"}}"#).unwrap();
+
+        assert_eq!(hello.client_version.as_deref(), Some("0.1.0"));
+        assert_eq!(hello.protocol_version, None);
     }
 
     #[test]

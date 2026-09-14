@@ -1,4 +1,8 @@
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use axum::http::{header, HeaderMap};
 use tokio::sync::Mutex;
@@ -8,7 +12,11 @@ pub(crate) struct RateLimiters {
     auth: RateLimiter,
     relationship_read: RateLimiter,
     relationship_write: RateLimiter,
+    staff_read: RateLimiter,
+    staff_write: RateLimiter,
+    chat_event: RateLimiter,
     chat_message: RateLimiter,
+    presence_update: RateLimiter,
 }
 
 impl RateLimiters {
@@ -17,7 +25,11 @@ impl RateLimiters {
             auth: RateLimiter::new(60, Duration::from_secs(60)),
             relationship_read: RateLimiter::new(120, Duration::from_secs(60)),
             relationship_write: RateLimiter::new(40, Duration::from_secs(60)),
+            staff_read: RateLimiter::new(240, Duration::from_secs(60)),
+            staff_write: RateLimiter::new(60, Duration::from_secs(60)),
+            chat_event: RateLimiter::new(120, Duration::from_secs(10)),
             chat_message: RateLimiter::new(20, Duration::from_secs(10)),
+            presence_update: RateLimiter::new(30, Duration::from_secs(10)),
         }
     }
 
@@ -56,6 +68,25 @@ impl RateLimiters {
 
     pub(crate) async fn check_chat_message(&self, user_id: Uuid) -> Result<(), RateLimitExceeded> {
         self.chat_message.check(format!("user:{user_id}")).await
+    }
+
+    pub(crate) async fn check_staff_read(&self, user_id: Uuid) -> Result<(), RateLimitExceeded> {
+        self.staff_read.check(format!("staff:{user_id}")).await
+    }
+
+    pub(crate) async fn check_staff_write(&self, user_id: Uuid) -> Result<(), RateLimitExceeded> {
+        self.staff_write.check(format!("staff:{user_id}")).await
+    }
+
+    pub(crate) async fn check_chat_event(&self, user_id: Uuid) -> Result<(), RateLimitExceeded> {
+        self.chat_event.check(format!("user:{user_id}")).await
+    }
+
+    pub(crate) async fn check_presence_update(
+        &self,
+        user_id: Uuid,
+    ) -> Result<(), RateLimitExceeded> {
+        self.presence_update.check(format!("user:{user_id}")).await
     }
 }
 
@@ -124,27 +155,37 @@ impl RateLimiter {
 }
 
 fn client_key(peer_addr: SocketAddr, headers: &HeaderMap, trust_proxy_headers: bool) -> String {
-    trusted_forwarded_addr(headers, trust_proxy_headers)
-        .map(|value| format!("ip:{value}"))
-        .unwrap_or_else(|| format!("ip:{}", peer_addr.ip()))
+    format!("ip:{}", client_ip(peer_addr, headers, trust_proxy_headers))
 }
 
-fn trusted_forwarded_addr(headers: &HeaderMap, trust_proxy_headers: bool) -> Option<String> {
+pub(crate) fn client_ip(
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+    trust_proxy_headers: bool,
+) -> IpAddr {
+    trusted_forwarded_addr(headers, trust_proxy_headers).unwrap_or_else(|| peer_addr.ip())
+}
+
+fn trusted_forwarded_addr(headers: &HeaderMap, trust_proxy_headers: bool) -> Option<IpAddr> {
     if !trust_proxy_headers {
         return None;
     }
-    forwarded_for(headers).or_else(|| header_value(headers, "x-real-ip"))
+    forwarded_for(headers).or_else(|| header_ip(headers, "x-real-ip"))
 }
 
-fn forwarded_for(headers: &HeaderMap) -> Option<String> {
+fn forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
     header_value(headers, "x-forwarded-for").and_then(|value| {
         value
             .split(',')
             .next()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
+            .and_then(|value| value.parse().ok())
     })
+}
+
+fn header_ip(headers: &HeaderMap, name: &'static str) -> Option<IpAddr> {
+    header_value(headers, name).and_then(|value| value.parse().ok())
 }
 
 fn header_value(headers: &HeaderMap, name: &'static str) -> Option<String> {
@@ -172,6 +213,25 @@ mod tests {
         assert!(limiter.check("user:b".to_string()).await.is_ok());
     }
 
+    #[tokio::test]
+    async fn keeps_staff_limits_separate_from_public_relationship_limits() {
+        let limits = RateLimiters::new();
+        let headers = HeaderMap::new();
+        let peer_addr = "127.0.0.1:1234".parse().unwrap();
+
+        for _ in 0..40 {
+            assert!(limits
+                .check_relationship_write(peer_addr, &headers, false)
+                .await
+                .is_ok());
+        }
+        assert!(limits
+            .check_relationship_write(peer_addr, &headers, false)
+            .await
+            .is_err());
+        assert!(limits.check_staff_write(Uuid::nil()).await.is_ok());
+    }
+
     #[test]
     fn ignores_forwarded_client_key_by_default() {
         let mut headers = HeaderMap::new();
@@ -192,6 +252,14 @@ mod tests {
             client_key("127.0.0.1:1234".parse().unwrap(), &headers, true),
             "ip:203.0.113.7"
         );
+    }
+
+    #[test]
+    fn extracts_forwarded_client_ip_when_trusted() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "127.0.0.1, 10.0.0.2".parse().unwrap());
+
+        assert!(client_ip("10.0.0.2:1234".parse().unwrap(), &headers, true).is_loopback());
     }
 
     #[test]

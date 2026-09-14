@@ -2,7 +2,7 @@
 param(
     [string]$Image = "ghcr.io/lero-aom/agora-server",
     [string]$Version,
-    [switch]$SkipLatest
+    [switch]$PublishLatest
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,7 +43,7 @@ try {
     }
 
     $tags = @("$Image`:$Version")
-    if (-not $SkipLatest) {
+    if ($PublishLatest) {
         $tags += "$Image`:latest"
     }
 
@@ -52,19 +52,37 @@ try {
         $tagArgs += @("-t", $tag)
     }
 
-    Invoke-Step "Publishing linux/amd64 server image" {
-        docker buildx build `
-            --platform linux/amd64 `
-            -f crates/agora-server/Dockerfile `
-            @tagArgs `
-            --push `
-            .
-    }
+    $metadataPath = Join-Path ([System.IO.Path]::GetTempPath()) "agora-server-image-$Version.json"
 
-    ""
-    "Published image tags:"
-    foreach ($tag in $tags) {
-        "  $tag"
+    try {
+        Invoke-Step "Publishing linux/amd64 server image" {
+            docker buildx build `
+                --platform linux/amd64 `
+                -f crates/agora-server/Dockerfile `
+                @tagArgs `
+                --metadata-file $metadataPath `
+                --push `
+                .
+        }
+
+        $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+        $digest = $metadata.'containerimage.digest'
+        if ([string]::IsNullOrWhiteSpace($digest)) {
+            throw "Buildx did not return a container image digest"
+        }
+
+        ""
+        "Published image tags:"
+        foreach ($tag in $tags) {
+            "  $tag"
+        }
+        "Immutable deployment reference:"
+        "  $Image@$digest"
+    }
+    finally {
+        if (Test-Path -LiteralPath $metadataPath) {
+            Remove-Item -LiteralPath $metadataPath -Force
+        }
     }
 }
 finally {

@@ -1,4 +1,9 @@
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env,
+    net::SocketAddr,
+    sync::{atomic::AtomicU64, Arc},
+    time::Duration,
+};
 
 use agora_common::{HealthResponse, VersionResponse, PROTOCOL_VERSION};
 use anyhow::{bail, Context, Result};
@@ -9,11 +14,11 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{postgres::PgPoolOptions, Connection, PgConnection, PgPool};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
 
@@ -26,12 +31,17 @@ mod rate_limit;
 mod relationships;
 mod visibility;
 
+const REALTIME_SINGLETON_LOCK_KEY: i64 = 0x4147_4F52_415F_5254;
+const REALTIME_SINGLETON_HEARTBEAT_SECONDS: u64 = 5;
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) config: Arc<Config>,
     pub(crate) db: PgPool,
     pub(crate) http: reqwest::Client,
     pub(crate) chat_tx: broadcast::Sender<chat::RealtimeEvent>,
+    pub(crate) realtime_state_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) visibility_epoch: Arc<AtomicU64>,
     pub(crate) presence: Arc<presence::PresenceTracker>,
     pub(crate) rate_limits: Arc<rate_limit::RateLimiters>,
 }
@@ -46,6 +56,7 @@ pub(crate) struct Config {
     pub(crate) session_secret: String,
     pub(crate) steam_web_api_key: Option<String>,
     pub(crate) enable_dev_login: bool,
+    pub(crate) dev_login_proxy_token: Option<String>,
     pub(crate) trust_proxy_headers: bool,
 }
 
@@ -65,6 +76,7 @@ impl Config {
         if enable_dev_login_requested && !public_url_is_loopback {
             bail!("AGORA_ENABLE_DEV_LOGIN can only be true when AGORA_PUBLIC_URL is loopback");
         }
+        validate_realtime_mode(&env_or("AGORA_REALTIME_MODE", "single-replica"))?;
         let session_secret = env_or("AGORA_SESSION_SECRET", "dev-insecure-change-me");
         validate_session_secret(&session_secret, public_url_is_loopback)?;
 
@@ -81,6 +93,7 @@ impl Config {
             run_migrations: env_bool("AGORA_RUN_MIGRATIONS", true)?,
             session_secret,
             steam_web_api_key: env_optional("STEAM_WEB_API_KEY"),
+            dev_login_proxy_token: env_optional("AGORA_DEV_LOGIN_PROXY_TOKEN"),
             trust_proxy_headers: env_bool("AGORA_TRUST_PROXY_HEADERS", false)?,
         })
     }
@@ -96,6 +109,7 @@ async fn main() -> Result<()> {
         .connect(&config.database_url)
         .await
         .context("failed to connect to PostgreSQL")?;
+    acquire_realtime_singleton_lock(&config.database_url).await?;
 
     if config.run_migrations {
         sqlx::migrate!("./migrations")
@@ -118,6 +132,8 @@ async fn main() -> Result<()> {
             .build()
             .context("failed to build HTTP client")?,
         chat_tx: chat::broadcast_channel(),
+        realtime_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+        visibility_epoch: Arc::new(AtomicU64::new(0)),
         presence: Arc::new(presence::PresenceTracker::new()),
         rate_limits: Arc::new(rate_limit::RateLimiters::new()),
     };
@@ -134,6 +150,34 @@ async fn main() -> Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("server failed")
+}
+
+async fn acquire_realtime_singleton_lock(database_url: &str) -> Result<()> {
+    let mut connection = PgConnection::connect(database_url)
+        .await
+        .context("failed to connect for realtime singleton lock")?;
+    let acquired = sqlx::query_scalar::<_, bool>("select pg_try_advisory_lock($1)")
+        .bind(REALTIME_SINGLETON_LOCK_KEY)
+        .fetch_one(&mut connection)
+        .await
+        .context("failed to acquire realtime singleton lock")?;
+    if !acquired {
+        bail!("another Agora server already owns the single-replica realtime lock")
+    }
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(REALTIME_SINGLETON_HEARTBEAT_SECONDS)).await;
+            if let Err(error) = sqlx::query_scalar::<_, i32>("select 1")
+                .fetch_one(&mut connection)
+                .await
+            {
+                error!(%error, "lost the realtime singleton lock connection; exiting to avoid split brain");
+                std::process::exit(1);
+            }
+        }
+    });
+    Ok(())
 }
 
 fn app(state: AppState) -> Router {
@@ -266,6 +310,14 @@ fn validate_session_secret(secret: &str, allow_insecure: bool) -> Result<()> {
     Ok(())
 }
 
+fn validate_realtime_mode(value: &str) -> Result<()> {
+    if value.trim() == "single-replica" {
+        Ok(())
+    } else {
+        bail!("AGORA_REALTIME_MODE must be single-replica until shared realtime delivery ships")
+    }
+}
+
 fn is_insecure_session_secret(secret: &str) -> bool {
     let normalized = secret.trim().to_ascii_lowercase();
     normalized.len() < 32
@@ -313,5 +365,11 @@ mod tests {
         assert!(parse_env_bool(Some("true"), false).unwrap());
         assert!(!parse_env_bool(Some("false"), true).unwrap());
         assert!(parse_env_bool(Some("maybe"), true).is_err());
+    }
+
+    #[test]
+    fn only_single_replica_realtime_mode_is_supported() {
+        assert!(validate_realtime_mode("single-replica").is_ok());
+        assert!(validate_realtime_mode("multi-instance").is_err());
     }
 }

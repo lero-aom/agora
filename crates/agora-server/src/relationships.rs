@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::atomic::Ordering};
 
 use agora_common::{
     ApiError, BlockListResponse, BlockUserRequest, BlockUserResponse, CreateReportRequest,
@@ -294,14 +294,15 @@ async fn block_user(
 ) -> RelationshipResult<Json<BlockUserResponse>> {
     check_relationship_write_limit(&state, peer_addr, &headers).await?;
     let user = current_user(&state, &headers).await?;
-    let target = user_by_id(&state, request.user_id).await?;
+    let target = user_by_id_any_status(&state, request.user_id).await?;
     if user.id == target.id {
         return Err(RelationshipError::bad_request("cannot block yourself"));
     }
 
+    let _realtime_state = state.realtime_state_lock.lock().await;
     let mut tx = state.db.begin().await?;
     lock_relationship_pair(&mut tx, user.id, target.id).await?;
-    sqlx::query(
+    let block_result = sqlx::query(
         "insert into blocks (blocker_id, blocked_id)
          values ($1, $2)
          on conflict (blocker_id, blocked_id) do nothing",
@@ -321,18 +322,20 @@ async fn block_user(
     .bind(target.id)
     .execute(&mut *tx)
     .await?;
+    if block_result.rows_affected() > 0 {
+        // Invalidate cached delivery decisions before this transaction becomes visible.
+        state.visibility_epoch.fetch_add(1, Ordering::AcqRel);
+    }
     tx.commit().await?;
-    send_relationship_changed(&state, user.id, target.id);
-    chat::send_user_event(
-        &state.chat_tx,
-        user.id,
-        agora_common::ServerEvent::UserMessagesHidden { user_id: target.id },
-    );
-    chat::send_user_event(
-        &state.chat_tx,
-        target.id,
-        agora_common::ServerEvent::UserMessagesHidden { user_id: user.id },
-    );
+    if block_result.rows_affected() > 0 {
+        send_relationship_changed(&state, user.id, target.id);
+        chat::send_user_event(
+            &state.chat_tx,
+            user.id,
+            agora_common::ServerEvent::UserMessagesHidden { user_id: target.id },
+        );
+        refresh_user_global_snapshot_locked(&state, target.id).await;
+    }
 
     Ok(Json(BlockUserResponse { blocked: true }))
 }
@@ -345,6 +348,7 @@ async fn unblock_user(
 ) -> RelationshipResult<Json<UnblockUserResponse>> {
     check_relationship_write_limit(&state, peer_addr, &headers).await?;
     let user = current_user(&state, &headers).await?;
+    let _realtime_state = state.realtime_state_lock.lock().await;
     let mut tx = state.db.begin().await?;
     lock_relationship_pair(&mut tx, user.id, user_id).await?;
     let result = sqlx::query("delete from blocks where blocker_id = $1 and blocked_id = $2")
@@ -352,9 +356,15 @@ async fn unblock_user(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    if result.rows_affected() > 0 {
+        // Invalidate cached delivery decisions before this transaction becomes visible.
+        state.visibility_epoch.fetch_add(1, Ordering::AcqRel);
+    }
     tx.commit().await?;
     if result.rows_affected() > 0 {
         send_relationship_changed(&state, user.id, user_id);
+        refresh_user_global_snapshot_locked(&state, user.id).await;
+        refresh_user_global_snapshot_locked(&state, user_id).await;
     }
 
     Ok(Json(UnblockUserResponse {
@@ -377,6 +387,7 @@ async fn create_report(
     let reason = normalize_required_text(&request.reason, "reason", MAX_REASON_LEN)?;
     let details = normalize_optional_text(request.details.as_deref(), MAX_DETAILS_LEN)?;
     validate_report_target(&state, user.id, &request).await?;
+    let message_kind = request.message_kind.map(message_kind_as_str);
 
     let row = sqlx::query(
         "insert into reports (
@@ -387,12 +398,19 @@ async fn create_report(
             reason,
             details
          ) values ($1, $2, $3, $4, $5, $6)
+         on conflict (
+             reporter_id,
+             reported_user_id,
+             coalesce(message_id, '00000000-0000-0000-0000-000000000000'::uuid),
+             coalesce(message_kind, '')
+         ) where status = 'open'
+         do update set id = reports.id
          returning id",
     )
     .bind(user.id)
     .bind(request.reported_user_id)
     .bind(request.message_id)
-    .bind(request.message_kind.map(message_kind_as_str))
+    .bind(message_kind)
     .bind(reason)
     .bind(details)
     .fetch_one(&state.db)
@@ -423,6 +441,19 @@ fn send_relationship_changed(state: &AppState, first: Uuid, second: Uuid) {
         second,
         agora_common::ServerEvent::RelationshipStateChanged,
     );
+}
+
+async fn refresh_user_global_snapshot_locked(state: &AppState, user_id: Uuid) {
+    if let Err(error) = chat::send_user_global_snapshot_locked(state, user_id).await {
+        warn!(%error, "failed to refresh global chat snapshot after a relationship change");
+        chat::send_user_event(
+            &state.chat_tx,
+            user_id,
+            agora_common::ServerEvent::GlobalMessageSnapshot {
+                messages: Vec::new(),
+            },
+        );
+    }
 }
 
 async fn check_relationship_read_limit(
@@ -456,6 +487,22 @@ async fn user_by_id(state: &AppState, user_id: Uuid) -> RelationshipResult<UserS
          where id = $1
            and banned_at is null
            and (suspended_until is null or suspended_until <= now())",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?
+    else {
+        return Err(RelationshipError::not_found("user was not found"));
+    };
+
+    Ok(row_to_user(&row)?)
+}
+
+async fn user_by_id_any_status(state: &AppState, user_id: Uuid) -> RelationshipResult<UserSummary> {
+    let Some(row) = sqlx::query(
+        "select id, display_name, avatar_url
+         from users
+         where id = $1",
     )
     .bind(user_id)
     .fetch_optional(&state.db)
@@ -595,7 +642,7 @@ async fn validate_report_target(
     reporter_id: Uuid,
     request: &CreateReportRequest,
 ) -> RelationshipResult<()> {
-    let _ = user_by_id(state, request.reported_user_id).await?;
+    let _ = user_by_id_any_status(state, request.reported_user_id).await?;
 
     match (request.message_id, request.message_kind) {
         (None, None) => Ok(()),

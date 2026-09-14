@@ -50,6 +50,11 @@ impl PresenceTracker {
         }
         counts_from(&users)
     }
+
+    pub(crate) async fn counts(&self) -> PresenceCounts {
+        let users = self.users.lock().await;
+        counts_from(&users)
+    }
 }
 
 fn counts_from(users: &HashMap<Uuid, UserPresence>) -> PresenceCounts {

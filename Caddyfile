@@ -1,4 +1,14 @@
 {$AGORA_SITE_ADDRESS} {
     encode zstd gzip
-    reverse_proxy server:8080
+    header {
+        Content-Security-Policy "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+        Referrer-Policy "no-referrer"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+    }
+    reverse_proxy server:8080 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Agora-Dev-Login-Proxy {$AGORA_DEV_LOGIN_PROXY_TOKEN}
+    }
 }

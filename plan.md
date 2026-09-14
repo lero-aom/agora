@@ -640,7 +640,8 @@ services:
   server:
     image: ghcr.io/<owner>/agora-server:<version>
     environment:
-      DATABASE_URL: postgres://agora:${POSTGRES_PASSWORD}@postgres:5432/agora
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_URL: postgres://agora@postgres:5432/agora
       AGORA_PUBLIC_URL: https://<domain>
       AGORA_SESSION_SECRET: ${AGORA_SESSION_SECRET}
       STEAM_WEB_API_KEY: ${STEAM_WEB_API_KEY}
