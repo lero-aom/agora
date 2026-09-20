@@ -6,9 +6,9 @@ Agora is an external Windows companion app for Age of Mythology: Retold that res
 
 It has one user-facing interface:
 
-- In-game menu overlay when AoM Retold is focused and the player is in multiplayer menus, lobby, or post-game.
+- In-game overlay when the AoM Retold window is focused.
 
-The overlay must hide automatically during matches and reappear after the match ends.
+Overlay visibility follows process, window, focus, and minimized-state detection only. Agora does not inspect menu, lobby, match, or post-game state.
 
 ## Non-Negotiable Constraints
 
@@ -26,7 +26,7 @@ The overlay must hide automatically during matches and reappear after the match 
 - No DLL injection.
 - No anti-cheat bypass.
 - No debug privilege enabling.
-- AoM memory probing is allowed only for game-state detection and must be documented clearly.
+- No AoM memory reads or game-state probing.
 
 ## MVP Scope
 
@@ -39,9 +39,8 @@ Required MVP functionality:
 - Block/report.
 - Presence counts: online, in game, looking for game.
 - Tray-only idle mode when AoM is not running or not focused.
-- Overlay mode when AoM is running and in eligible multiplayer/menu states.
-- Automatic overlay hide during matches.
-- Automatic overlay re-show in post-game.
+- Overlay mode when the AoM window is running, visible, and focused.
+- Automatic hide when AoM is minimized, unfocused, or not running.
 - Automatic updates.
 - Server-side minimum client version gate.
 - Basic moderation tooling for reports and bans.
@@ -81,7 +80,7 @@ Responsibilities:
 - Local session storage.
 - WebSocket connection and reconnect logic.
 - AoM process/window detection.
-- Read-only AoM game-state probe.
+- AoM process/window, focus, bounds, and minimized-state detection only.
 - Auto-update check and restart.
 
 ### `agora-server`
@@ -132,7 +131,7 @@ Use:
 - `reqwest` for HTTP.
 - `tokio-tungstenite` or equivalent WebSocket client.
 - `keyring` for storing refresh/session tokens in Windows Credential Manager.
-- `self_update` or a small manifest-based updater for automatic updates.
+- A small in-client signed-manifest updater for automatic updates; do not use a third-party updater framework.
 
 The client should not contain server secrets, Steam API keys, or Microsoft secrets.
 
@@ -431,7 +430,7 @@ Rules:
 
 - `online`: connected to WebSocket.
 - `looking_for_game`: connected and user toggled LFG on.
-- `in_game`: client reports AoM match state as `InMatch`.
+- `in_game`: connected user manually selects the in-game availability state; Agora does not infer it from AoM.
 - Stale sessions expire if no heartbeat is received within a short timeout.
 - Counts are broadcast periodically and after meaningful state changes.
 
@@ -445,72 +444,16 @@ Presence display:
 
 ## AoM Detection And Overlay State
 
-Use a small detector in the client.
-
-Detector states:
-
-```text
-NotRunning
-RunningUnknown
-MainMenu
-MultiplayerMenu
-Lobby
-InMatch
-PostGame
-```
+The client detects `AoMRT_s.exe`, finds its main visible window, and tracks client bounds, foreground focus, and minimized state through standard read-only Windows window/process APIs. It does not read AoM memory or classify menus, lobbies, matches, or post-game screens.
 
 Overlay visibility rules:
 
-- `NotRunning`: stay hidden in the system tray.
-- `MultiplayerMenu`: show overlay.
-- `Lobby`: show overlay.
-- `PostGame`: show overlay.
-- `InMatch`: hide overlay.
-- `RunningUnknown`: hide overlay by default.
-- `MainMenu`: hide overlay by default unless later testing proves this is useful.
+- No visible AoM window or a minimized window: stay hidden in the system tray.
+- Focused AoM window: show the passive overlay.
+- Interactive Agora window: keep the interactive overlay visible while it has focus.
+- Any unrelated foreground application: hide the overlay safely.
 
-Detection implementation:
-
-1. Detect `AoMRT_s.exe` using Windows process enumeration.
-2. Find the main visible AoM window for the process.
-3. Track window bounds and foreground/minimized state.
-4. Add read-only game-state probing only for state classification.
-5. Reuse the safe patterns from `mythicwharf` where appropriate.
-
-Current implementation status:
-
-- Implemented: visible AoM window detection by process/window, foreground-event hook wakeups, client-rect tracking, foreground-focus gating, minimized-window filtering, top-center passive disabled/no-activate/click-through overlay, tap-once `Ctrl+Enter` typing-mode entry/exit using pressed-only global hotkey events, `Escape` typing-mode exit, compact chat-mode tabs, tray-only idle mode, and global chat composer autofocus.
-- Not yet implemented: menu/lobby/post-game classification and automatic match hide/re-show.
-
-Allowed AoM process access:
-
-```text
-OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
-ReadProcessMemory
-CreateToolhelp32Snapshot
-VirtualQueryEx if signature scanning is needed
-```
-
-Forbidden AoM process access:
-
-```text
-WriteProcessMemory
-CreateRemoteThread
-DLL injection
-debug privilege escalation
-process hiding/evasion
-memory patching
-input automation
-```
-
-The memory probe must read only the minimum addresses needed to classify the game state. It must not read player resources, map data, units, stats, chat, or match data.
-
-If game-state signatures break after an AoM update:
-
-- Hide the overlay by default.
-- Keep the app hidden in tray until detection is updated.
-- Show a clear detector status.
-- Update detection config through an Agora release.
+Forbidden AoM process access includes memory reads and writes, remote threads, DLL injection, debug privilege escalation, process hiding/evasion, memory patching, and input automation.
 
 ## Overlay Implementation
 
@@ -525,8 +468,6 @@ Overlay requirements:
 - Hide when AoM is minimized.
 - Hide when AoM loses foreground focus unless the overlay is currently focused for typing.
 - React to foreground changes through `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` instead of relying only on polling.
-- Hide during `InMatch`.
-- Re-show in `PostGame`.
 - Provide manual tap-once `Ctrl+Enter` typing-mode entry only while AoM is foreground.
 - Return to passive mode with `Escape` or tap-once `Ctrl+Enter` and explicitly focus AoM.
 - Suspend and hide typing mode if it loses focus to another app; restore it when AoM is foreground again.
@@ -555,7 +496,7 @@ Overlay mode:
 - Chat mode sends global messages with `Enter` and stays in typing mode.
 - Tapping `Escape` or `Ctrl+Enter` exits chat mode, returns to passive mode, and focuses AoM.
 - Focusing another app hides Agora; passive mode remains passive, while chat mode is suspended and restored when AoM is foreground again.
-- Chat mode has a compact left tab column for Global, Friends, and Block/report.
+- Chat mode has a compact left tab column for Global, Messages, Friends, and Block/report.
 - No large settings or admin screens in overlay.
 
 ## Moderation Plan
@@ -592,20 +533,21 @@ Must document:
 Required trust statement:
 
 ```text
-Agora uses read-only Windows APIs to detect Age of Mythology: Retold process and game-state information. It does not write game memory, inject code, automate input, bypass anti-cheat, or read gameplay data beyond the minimum state needed to decide whether the chat overlay should be visible.
+Agora uses read-only Windows APIs to detect the Age of Mythology: Retold process, window bounds, focus, and minimized state. It does not read or write game memory, infer game state, inject code, automate input, bypass anti-cheat, or read gameplay data.
 ```
 
 ## Automatic Updates
 
 Use signed/checksummed release artifacts.
 
-Recommended first implementation:
+Required implementation:
 
-- Publish Windows builds through GitHub Releases.
-- Client checks for updates on startup.
-- Client checks at most once per configured interval.
-- Client verifies checksum/signature before replacing itself.
-- Client restarts into the new version after update.
+- Compile the HTTPS update base URL and Ed25519 public key into each official client; never derive updater metadata from the chat server URL.
+- Fetch a fixed raw manifest and detached signature without redirects, verify the signature before JSON parsing, and reject unknown schema fields, non-stable versions, wrong targets, unsafe filenames, invalid size, and non-lowercase SHA-256 values.
+- Stream the executable into the running executable's directory, enforce signed byte count and digest, then use a copied same-directory helper to wait for exit and atomically replace/restart on Windows.
+- Preserve an on-disk backup and recovery record until the replacement executable has started successfully. Keep the previous executable and expose a manual release fallback on download, validation, or replacement failure.
+- Check on startup for non-loopback servers, surface an accessible status banner with retry and manual-release actions, and trigger an immediate signed check for minimum-version or protocol events.
+- Manually distribute the first updater-capable bootstrap build. It can then update itself from subsequent signed releases.
 - Server exposes minimum supported client version at `GET /version`.
 - WebSocket handshake rejects clients below minimum version with `minimum_version_required`.
 
@@ -626,23 +568,24 @@ Recommended `docker-compose.yml` shape:
 ```text
 services:
   proxy:
-    image: caddy:latest
+    image: caddy:<reviewed-tag>@sha256:<reviewed-digest>
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./Caddyfile.production:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
       - server
 
   server:
-    image: ghcr.io/<owner>/agora-server:<version>
+    image: ghcr.io/<owner>/agora-server@sha256:<published-digest>
     environment:
       PGPASSWORD: ${POSTGRES_PASSWORD}
       DATABASE_URL: postgres://agora@postgres:5432/agora
       AGORA_PUBLIC_URL: https://<domain>
+      AGORA_ENABLE_DEV_LOGIN: false
       AGORA_SESSION_SECRET: ${AGORA_SESSION_SECRET}
       STEAM_WEB_API_KEY: ${STEAM_WEB_API_KEY}
       AGORA_MIN_CLIENT_VERSION: ${AGORA_MIN_CLIENT_VERSION}
@@ -651,7 +594,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:17
+    image: postgres:<reviewed-major-tag>@sha256:<reviewed-digest>
     environment:
       POSTGRES_DB: agora
       POSTGRES_USER: agora
@@ -671,10 +614,18 @@ Deployment requirements:
 - TLS through Caddy or nginx + Let's Encrypt.
 - `.env` file on VPS for secrets.
 - Database migrations run during deployment or server startup.
-- Daily PostgreSQL backups.
+- Daily PostgreSQL backups with off-host encrypted retention and tested restores.
 - Log rotation.
 - Firewall open only for SSH, HTTP, HTTPS.
 - SSH key auth only.
+- Deploy immutable image digests, not `latest` or mutable version tags.
+- Keep the server and PostgreSQL off host ports; only Caddy publishes HTTP/HTTPS.
+- Run the server as a non-root user with a read-only filesystem, dropped capabilities, and bounded resources.
+- Use Compose health checks for PostgreSQL, the database-aware server health endpoint, and Caddy's proxied health endpoint.
+- Keep Caddy-to-server and server-to-PostgreSQL traffic on separate internal networks; give only the server explicit egress for Steam services.
+- Preserve an AGPL source offer for the exact server revision deployed.
+
+The checked-in `docker-compose.prod.yml`, `Caddyfile.production`, and `docs/` runbooks are the authoritative production configuration and procedure. The illustrative block above must not replace their digest, network, health, or hardening settings.
 
 ## Development Milestones
 
@@ -751,18 +702,15 @@ Deliverables:
 
 - Process detection for `AoMRT_s.exe`.
 - Main AoM window detection and bounds tracking.
-- Read-only game-state probe limited to overlay visibility.
 - Detector status UI.
 - Interactive overlay shell.
-- Automatic hide during `InMatch`.
-- Automatic show during `MultiplayerMenu`, `Lobby`, and `PostGame`.
+- Automatic hide when AoM is minimized, unfocused, or not running.
 
 Acceptance criteria:
 
 - Standalone app appears when AoM is not running.
-- Overlay appears in eligible AoM multiplayer/menu states.
-- Overlay hides during matches.
-- Overlay reappears after match completion.
+- Overlay appears when the AoM window is focused.
+- Overlay hides safely when AoM is minimized, unfocused, or absent.
 - If detection fails, overlay hides safely and standalone chat remains usable.
 
 ### Milestone 6: Reports And Moderation

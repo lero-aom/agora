@@ -1,4 +1,9 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use agora_common::{
     ApiError, AuthSession, DevLoginRequest, DevLoginResponse, LogoutRequest, LogoutResponse,
@@ -22,16 +27,39 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{chat, AppState};
+use crate::{chat, normalize_dev_account_id, AppState, DevLoginAccount};
 
 const STEAM_OPENID_ENDPOINT: &str = "https://steamcommunity.com/openid/login";
 const STEAM_IDENTIFIER_SELECT: &str = "http://specs.openid.net/auth/2.0/identifier_select";
 const LOGIN_CHALLENGE_EXPIRES_SECONDS: u64 = 10 * 60;
 const ACCESS_TOKEN_EXPIRES_SECONDS: u64 = 15 * 60;
 const REFRESH_TOKEN_EXPIRES_SECONDS: u64 = 30 * 24 * 60 * 60;
+const ABSOLUTE_SESSION_EXPIRES_SECONDS: u64 = 90 * 24 * 60 * 60;
+const AUTH_RECORD_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
+const LOGIN_CHALLENGE_RETENTION_SECONDS: u64 = 24 * 60 * 60;
+const AUTH_CLEANUP_INTERVAL_SECONDS: u64 = 5 * 60;
+const MIN_REFRESH_ROTATION_INTERVAL_SECONDS: u64 = 5 * 60;
+const MAX_SESSION_FAMILY_TOKENS: i64 =
+    (ABSOLUTE_SESSION_EXPIRES_SECONDS / MIN_REFRESH_ROTATION_INTERVAL_SECONDS) as i64 + 1;
+static LAST_AUTH_CLEANUP_UNIX_SECONDS: AtomicU64 = AtomicU64::new(0);
 
 type HmacSha256 = Hmac<Sha256>;
 type AuthResult<T> = Result<T, AuthError>;
+
+#[derive(Clone, Copy)]
+enum SessionSource {
+    Steam,
+    LocalTest,
+}
+
+impl SessionSource {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::Steam => "steam",
+            Self::LocalTest => "local_test",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AuthenticatedSession {
@@ -53,6 +81,8 @@ pub(crate) struct Principal {
 pub(crate) enum SessionActivity {
     Active,
     AccessTokenExpired,
+    Revoked,
+    UserRestricted,
     Ended,
 }
 
@@ -83,7 +113,7 @@ impl FromRequestParts<AppState> for Principal {
             .ok_or_else(|| AuthError::internal("missing client connection details"))?;
         state
             .rate_limits
-            .check_auth(peer_addr, &parts.headers, state.config.trust_proxy_headers)
+            .check_auth(peer_addr, &parts.headers, &state.config.trusted_proxy_cidrs)
             .await
             .map_err(|error| AuthError::too_many_requests(error.message()))?;
         principal_for_headers(state, &parts.headers).await
@@ -98,6 +128,84 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
         .route("/auth/dev/login", post(dev_login))
+}
+
+pub(crate) async fn revoke_unconfigured_local_test_sessions(
+    db: &sqlx::PgPool,
+    config: &crate::Config,
+) -> Result<(), sqlx::Error> {
+    let provider_user_ids = configured_local_test_provider_user_ids(config);
+    sqlx::query(
+        "update sessions s
+         set revoked_at = now()
+         where s.auth_source = 'local_test'
+           and s.revoked_at is null
+           and not exists (
+               select 1
+               from identities i
+               where i.user_id = s.user_id
+                 and i.provider = 'dev'
+                 and i.provider_user_id = any($1)
+           )",
+    )
+    .bind(provider_user_ids)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn reconcile_local_test_accounts(
+    db: &sqlx::PgPool,
+    config: &crate::Config,
+) -> Result<(), sqlx::Error> {
+    if !config.enable_dev_login {
+        return Ok(());
+    }
+
+    let provider_user_ids = configured_local_test_provider_user_ids(config);
+    let mut tx = db.begin().await?;
+    for account in &config.dev_login_accounts {
+        find_or_create_dev_user(&mut tx, account).await?;
+    }
+    sqlx::query(
+        "update users u
+          set role = 'user'
+          where exists (
+                select 1
+                from identities dev_identity
+                where dev_identity.user_id = u.id
+                  and dev_identity.provider = 'dev'
+            )
+            and not exists (
+                select 1
+                from identities configured_dev_identity
+                where configured_dev_identity.user_id = u.id
+                  and configured_dev_identity.provider = 'dev'
+                  and configured_dev_identity.provider_user_id = any($1)
+            )
+            and not exists (
+                select 1
+                from identities steam_identity
+                where steam_identity.user_id = u.id
+                  and steam_identity.provider = 'steam'
+            )",
+    )
+    .bind(provider_user_ids)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+fn configured_local_test_provider_user_ids(config: &crate::Config) -> Vec<String> {
+    if !config.enable_dev_login {
+        return Vec::new();
+    }
+    config
+        .dev_login_accounts
+        .iter()
+        .map(|account| dev_provider_user_id(&account.account_id))
+        .collect()
 }
 
 pub(crate) async fn user_for_access_token(
@@ -118,18 +226,26 @@ pub(crate) async fn user_for_access_token(
          from users u
          where u.id = s.user_id
            and s.access_token_hash = $1
-           and s.access_token_expires_at > now()
-           and s.revoked_at is null
-           and s.expires_at > now()
-           and u.banned_at is null
+            and s.access_token_expires_at > now()
+            and s.revoked_at is null
+            and s.expires_at > now()
+            and s.absolute_expires_at > now()
+            and u.banned_at is null
            and (u.suspended_until is null or u.suspended_until <= now())
          returning
             s.id as session_id,
             u.id as user_id,
-            u.display_name,
-            u.avatar_url,
-            u.role,
-            greatest(1, extract(epoch from (s.access_token_expires_at - now()))::bigint) as access_token_ttl_seconds",
+             u.display_name,
+             u.avatar_url,
+             u.role,
+             s.auth_source,
+             (
+                 select i.provider_user_id
+                 from identities i
+                 where i.user_id = u.id and i.provider = 'dev'
+                 limit 1
+             ) as dev_provider_user_id,
+             greatest(1, extract(epoch from (s.access_token_expires_at - now()))::bigint) as access_token_ttl_seconds",
     )
     .bind(access_token_hash)
     .fetch_optional(&state.db)
@@ -138,6 +254,23 @@ pub(crate) async fn user_for_access_token(
         return Ok(None);
     };
 
+    let stored_role = user_role_from_db(row.try_get::<String, _>("role")?.as_str());
+    let source: String = row.try_get("auth_source")?;
+    let role = match source.as_str() {
+        "steam" => stored_role,
+        "local_test" => {
+            let provider_user_id: Option<String> = row.try_get("dev_provider_user_id")?;
+            let Some(role) = local_test_role(
+                state.config.enable_dev_login,
+                &state.config.dev_login_accounts,
+                provider_user_id.as_deref(),
+            ) else {
+                return Ok(None);
+            };
+            role
+        }
+        _ => return Ok(None),
+    };
     let ttl: i64 = row.try_get("access_token_ttl_seconds")?;
     Ok(Some(AuthenticatedSession {
         session_id: row.try_get("session_id")?,
@@ -146,7 +279,7 @@ pub(crate) async fn user_for_access_token(
             display_name: row.try_get("display_name")?,
             avatar_url: row.try_get("avatar_url")?,
         },
-        role: user_role_from_db(row.try_get::<String, _>("role")?.as_str()),
+        role,
         access_token_ttl_seconds: ttl.max(1) as u64,
     }))
 }
@@ -176,17 +309,56 @@ fn user_role_from_db(value: &str) -> UserRole {
     }
 }
 
+fn user_role_as_db(role: UserRole) -> &'static str {
+    match role {
+        UserRole::User => "user",
+        UserRole::Moderator => "moderator",
+        UserRole::Admin => "admin",
+        UserRole::Owner => "owner",
+    }
+}
+
+fn local_test_role(
+    dev_login_enabled: bool,
+    accounts: &[DevLoginAccount],
+    provider_user_id: Option<&str>,
+) -> Option<UserRole> {
+    if !dev_login_enabled {
+        return None;
+    }
+    let account_id = provider_user_id?.strip_prefix("local:")?;
+    accounts
+        .iter()
+        .find(|account| account.account_id == account_id)
+        .map(|account| account.role)
+}
+
 pub(crate) async fn session_activity(
     state: &AppState,
     session_id: Uuid,
 ) -> Result<SessionActivity, sqlx::Error> {
-    let Some((access_token_active, session_active)) = sqlx::query_as::<_, (bool, bool)>(
+    let Some((
+        access_token_active,
+        session_revoked,
+        session_lifetime_active,
+        user_restricted,
+        source,
+        provider_user_id,
+    )) = sqlx::query_as::<_, (bool, bool, bool, bool, String, Option<String>)>(
         "select
-            s.access_token_expires_at > now() as access_token_active,
-            s.revoked_at is null
-              and s.expires_at > now()
-              and u.banned_at is null
-              and (u.suspended_until is null or u.suspended_until <= now()) as session_active
+             s.access_token_expires_at > now() as access_token_active,
+             s.revoked_at is not null as session_revoked,
+             (s.expires_at > now()
+               and s.absolute_expires_at > now()) as session_lifetime_active,
+             (u.banned_at is not null
+               or (u.suspended_until is not null and u.suspended_until > now())) as user_restricted,
+             s.auth_source,
+            (
+                select i.provider_user_id
+                from identities i
+                where i.user_id = u.id and i.provider = 'dev'
+                limit 1
+            ) as dev_provider_user_id
          from sessions s
          join users u on u.id = s.user_id
          where s.id = $1",
@@ -198,7 +370,21 @@ pub(crate) async fn session_activity(
         return Ok(SessionActivity::Ended);
     };
 
-    Ok(if !session_active {
+    let source_is_allowed = match source.as_str() {
+        "steam" => true,
+        "local_test" => local_test_role(
+            state.config.enable_dev_login,
+            &state.config.dev_login_accounts,
+            provider_user_id.as_deref(),
+        )
+        .is_some(),
+        _ => false,
+    };
+    Ok(if user_restricted {
+        SessionActivity::UserRestricted
+    } else if session_revoked {
+        SessionActivity::Revoked
+    } else if !session_lifetime_active || !source_is_allowed {
         SessionActivity::Ended
     } else if !access_token_active {
         SessionActivity::AccessTokenExpired
@@ -235,20 +421,26 @@ async fn dev_login(
     }
     state
         .rate_limits
-        .check_auth(peer_addr, &headers, state.config.trust_proxy_headers)
+        .check_auth(peer_addr, &headers, &state.config.trusted_proxy_cidrs)
         .await
         .map_err(|error| AuthError::too_many_requests(error.message()))?;
+    opportunistic_auth_cleanup(&state).await;
 
-    let display_name = normalize_dev_display_name(
-        request
-            .and_then(|Json(request)| request.display_name)
-            .as_deref(),
-    )?;
-    let provider_user_id = dev_provider_user_id(&display_name);
+    let account_id = request
+        .map(|Json(request)| request.account_id)
+        .ok_or_else(|| AuthError::bad_request("local test account ID is required"))?;
+    let account_id = normalize_dev_account_id(&account_id)
+        .map_err(|error| AuthError::bad_request(error.to_string()))?;
+    let account = state
+        .config
+        .dev_login_accounts
+        .iter()
+        .find(|account| account.account_id == account_id)
+        .ok_or_else(|| AuthError::bad_request("unknown local test account"))?;
 
     let mut tx = state.db.begin().await?;
-    let user = find_or_create_dev_user(&mut tx, &provider_user_id, &display_name).await?;
-    let session = create_session(&state, &mut tx, user).await?;
+    let user = find_or_create_dev_user(&mut tx, account).await?;
+    let session = create_session(&state, &mut tx, user, SessionSource::LocalTest).await?;
     tx.commit().await?;
 
     Ok(Json(DevLoginResponse { session }))
@@ -261,7 +453,7 @@ async fn steam_login_start(
 ) -> AuthResult<Json<SteamLoginStartResponse>> {
     state
         .rate_limits
-        .check_auth(peer_addr, &headers, state.config.trust_proxy_headers)
+        .check_auth(peer_addr, &headers, &state.config.trusted_proxy_cidrs)
         .await
         .map_err(|error| AuthError::too_many_requests(error.message()))?;
     expire_old_login_challenges(&state).await?;
@@ -306,7 +498,7 @@ async fn steam_login_poll(
 ) -> AuthResult<Json<SteamLoginPollResponse>> {
     state
         .rate_limits
-        .check_auth(peer_addr, &headers, state.config.trust_proxy_headers)
+        .check_auth(peer_addr, &headers, &state.config.trusted_proxy_cidrs)
         .await
         .map_err(|error| AuthError::too_many_requests(error.message()))?;
     expire_old_login_challenges(&state).await?;
@@ -320,15 +512,12 @@ async fn steam_login_poll(
         "select
             c.id,
             c.status,
-            c.user_id,
-            c.error,
-            c.expires_at <= now() as expired,
-            c.consumed_at is not null as consumed,
-            u.display_name,
-            u.avatar_url
-         from steam_login_challenges c
-         left join users u on u.id = c.user_id
-         where c.poll_token_hash = $1",
+             c.user_id,
+             c.error,
+             c.expires_at <= now() as expired,
+             c.consumed_at is not null as consumed
+          from steam_login_challenges c
+          where c.poll_token_hash = $1",
     )
     .bind(poll_token_hash)
     .fetch_optional(&state.db)
@@ -382,16 +571,32 @@ async fn steam_login_poll(
             let user_id = row
                 .try_get::<Option<Uuid>, _>("user_id")?
                 .ok_or_else(|| AuthError::internal("completed login is missing a user"))?;
-            let user = UserSummary {
-                id: user_id,
-                display_name: row.try_get("display_name")?,
-                avatar_url: row.try_get("avatar_url")?,
-            };
             let mut tx = state.db.begin().await?;
+            let Some(user) = active_user_for_session_tx(&mut tx, user_id).await? else {
+                let denied = sqlx::query(
+                    "update steam_login_challenges
+                     set status = 'denied', error = 'account is unavailable'
+                     where id = $1 and status = 'complete' and consumed_at is null",
+                )
+                .bind(challenge_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                let message = if denied.rows_affected() == 1 {
+                    "account is unavailable"
+                } else {
+                    "login challenge was already used"
+                };
+                return Ok(Json(SteamLoginPollResponse {
+                    status: SteamLoginStatus::Denied {
+                        message: message.to_string(),
+                    },
+                }));
+            };
             let claimed = sqlx::query(
                 "update steam_login_challenges
                  set consumed_at = now()
-                 where id = $1 and consumed_at is null
+                 where id = $1 and status = 'complete' and consumed_at is null
                  returning id",
             )
             .bind(challenge_id)
@@ -406,7 +611,7 @@ async fn steam_login_poll(
                 }));
             }
 
-            let session = create_session(&state, &mut tx, user).await?;
+            let session = create_session(&state, &mut tx, user, SessionSource::Steam).await?;
             tx.commit().await?;
 
             Ok(Json(SteamLoginPollResponse {
@@ -425,9 +630,10 @@ async fn refresh(
 ) -> AuthResult<Json<RefreshResponse>> {
     state
         .rate_limits
-        .check_auth(peer_addr, &headers, state.config.trust_proxy_headers)
+        .check_auth(peer_addr, &headers, &state.config.trusted_proxy_cidrs)
         .await
         .map_err(|error| AuthError::too_many_requests(error.message()))?;
+    opportunistic_auth_cleanup(&state).await;
     let refresh_token = request.refresh_token.trim();
     if refresh_token.is_empty() {
         return Err(AuthError::bad_request("refresh token is required"));
@@ -435,22 +641,42 @@ async fn refresh(
 
     let refresh_token_hash = token_hash(refresh_token, &state.config.session_secret)?;
     let mut tx = state.db.begin().await?;
+    let Some(token_user_id) =
+        sqlx::query_scalar::<_, Uuid>("select user_id from sessions where refresh_token_hash = $1")
+            .bind(&refresh_token_hash)
+            .fetch_optional(&mut *tx)
+            .await?
+    else {
+        return Err(AuthError::unauthorized("session is invalid or expired"));
+    };
+    let Some((user, user_active)) = user_for_session_update_tx(&mut tx, token_user_id).await?
+    else {
+        return Err(AuthError::unauthorized("session is invalid or expired"));
+    };
     let Some(row) = sqlx::query(
         "select
             s.id as session_id,
-            u.id as user_id,
-            u.display_name,
-            u.avatar_url
-         from sessions s
-         join users u on u.id = s.user_id
-          where s.refresh_token_hash = $1
-            and s.revoked_at is null
-            and s.expires_at > now()
-            and u.banned_at is null
-            and (u.suspended_until is null or u.suspended_until <= now())
+            s.session_family_id,
+             s.refresh_token_used_at is not null as refresh_token_used,
+             s.revoked_at is not null as session_revoked,
+             s.expires_at > now() as refresh_token_active,
+             s.absolute_expires_at > now() as absolute_session_active,
+             s.created_at
+                 <= now() - make_interval(secs => $2) as refresh_rotation_due,
+             s.auth_source,
+            (
+                select i.provider_user_id
+                from identities i
+                where i.user_id = s.user_id and i.provider = 'dev'
+                limit 1
+            ) as dev_provider_user_id
+          from sessions s
+          where s.refresh_token_hash = $1 and s.user_id = $3
           for update of s",
     )
-    .bind(refresh_token_hash)
+    .bind(&refresh_token_hash)
+    .bind(MIN_REFRESH_ROTATION_INTERVAL_SECONDS as i32)
+    .bind(token_user_id)
     .fetch_optional(&mut *tx)
     .await?
     else {
@@ -458,11 +684,70 @@ async fn refresh(
     };
 
     let session_id: Uuid = row.try_get("session_id")?;
-    let user = UserSummary {
-        id: row.try_get("user_id")?,
-        display_name: row.try_get("display_name")?,
-        avatar_url: row.try_get("avatar_url")?,
+    let session_family_id: Uuid = row.try_get("session_family_id")?;
+    let refresh_token_used: bool = row.try_get("refresh_token_used")?;
+    let session_revoked: bool = row.try_get("session_revoked")?;
+    let refresh_token_active: bool = row.try_get("refresh_token_active")?;
+    let absolute_session_active: bool = row.try_get("absolute_session_active")?;
+    let refresh_rotation_due: bool = row.try_get("refresh_rotation_due")?;
+    if refresh_token_used {
+        let revoked_session_ids = if session_revoked {
+            Vec::new()
+        } else {
+            revoke_session_family_tx(&mut tx, session_family_id).await?
+        };
+        tx.commit().await?;
+        if !revoked_session_ids.is_empty() {
+            warn!(%session_family_id, "detected refresh token reuse; revoked session family");
+            for revoked_session_id in revoked_session_ids {
+                chat::send_session_revoked(&state, revoked_session_id);
+            }
+        }
+        return Err(AuthError::unauthorized("session is invalid or expired"));
+    }
+
+    let source: String = row.try_get("auth_source")?;
+    let allowed = match source.as_str() {
+        "steam" => true,
+        "local_test" => {
+            let provider_user_id: Option<String> = row.try_get("dev_provider_user_id")?;
+            local_test_role(
+                state.config.enable_dev_login,
+                &state.config.dev_login_accounts,
+                provider_user_id.as_deref(),
+            )
+            .is_some()
+        }
+        _ => false,
     };
+    if session_revoked
+        || !refresh_token_active
+        || !absolute_session_active
+        || !user_active
+        || !allowed
+    {
+        tx.rollback().await?;
+        return Err(AuthError::unauthorized("session is invalid or expired"));
+    }
+    if !refresh_rotation_due {
+        tx.rollback().await?;
+        return Err(AuthError::too_many_requests(format!(
+            "session refresh can rotate once every {} seconds",
+            MIN_REFRESH_ROTATION_INTERVAL_SECONDS
+        )));
+    }
+    let family_token_count = session_family_token_count_tx(&mut tx, session_family_id).await?;
+    if session_family_at_capacity(family_token_count) {
+        let revoked_session_ids = revoke_session_family_tx(&mut tx, session_family_id).await?;
+        tx.commit().await?;
+        warn!(%session_family_id, "session refresh family reached its token limit; revoked family");
+        for revoked_session_id in revoked_session_ids {
+            chat::send_session_revoked(&state, revoked_session_id);
+        }
+        return Err(AuthError::unauthorized(
+            "session refresh limit reached; sign in again",
+        ));
+    }
     let session = rotate_session(&state, &mut tx, session_id, user).await?;
     tx.commit().await?;
 
@@ -477,26 +762,50 @@ async fn logout(
 ) -> AuthResult<Json<LogoutResponse>> {
     state
         .rate_limits
-        .check_auth(peer_addr, &headers, state.config.trust_proxy_headers)
+        .check_auth(peer_addr, &headers, &state.config.trusted_proxy_cidrs)
         .await
         .map_err(|error| AuthError::too_many_requests(error.message()))?;
+    opportunistic_auth_cleanup(&state).await;
     let refresh_token = request.refresh_token.trim();
     if refresh_token.is_empty() {
         return Err(AuthError::bad_request("refresh token is required"));
     }
 
     let refresh_token_hash = token_hash(refresh_token, &state.config.session_secret)?;
+    let mut tx = state.db.begin().await?;
+    let Some(user_id) =
+        sqlx::query_scalar::<_, Uuid>("select user_id from sessions where refresh_token_hash = $1")
+            .bind(&refresh_token_hash)
+            .fetch_optional(&mut *tx)
+            .await?
+    else {
+        return Ok(Json(LogoutResponse { revoked: false }));
+    };
+    if user_for_session_update_tx(&mut tx, user_id)
+        .await?
+        .is_none()
+    {
+        return Ok(Json(LogoutResponse { revoked: false }));
+    }
     let rows = sqlx::query(
-        "update sessions
+        "with target_family as (
+             select session_family_id
+             from sessions
+             where refresh_token_hash = $1
+         )
+         update sessions s
          set revoked_at = now()
-         where refresh_token_hash = $1 and revoked_at is null
-         returning id",
+         from target_family f
+         where s.session_family_id = f.session_family_id
+           and s.revoked_at is null
+         returning s.id",
     )
-    .bind(refresh_token_hash)
-    .fetch_all(&state.db)
+    .bind(&refresh_token_hash)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     for row in &rows {
-        chat::send_session_revoked(&state.chat_tx, row.try_get("id")?);
+        chat::send_session_revoked(&state, row.try_get("id")?);
     }
 
     Ok(Json(LogoutResponse {
@@ -515,29 +824,30 @@ async fn complete_steam_login(
     let result = async {
         validate_steam_openid(state, query).await?;
         let steam_id = steam_id_from_openid_claim(query)?;
-        find_or_create_steam_user(state, &steam_id).await
+        let profile = steam_profile(state, &steam_id).await;
+        let mut tx = state.db.begin().await?;
+        let user = find_or_create_steam_user(&mut tx, &steam_id, profile.as_ref()).await?;
+        let result = sqlx::query(
+            "update steam_login_challenges
+             set status = 'complete', user_id = $2, completed_at = now(), error = null
+             where id = $1 and status = 'pending' and expires_at > now()",
+        )
+        .bind(challenge_id)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(AuthError::bad_request(
+                "login challenge expired or is no longer pending",
+            ));
+        }
+        tx.commit().await?;
+        Ok(user)
     }
     .await;
 
     match result {
-        Ok(user) => {
-            let result = sqlx::query(
-                "update steam_login_challenges
-                 set status = 'complete', user_id = $2, completed_at = now(), error = null
-                 where id = $1 and status = 'pending' and expires_at > now()",
-            )
-            .bind(challenge_id)
-            .bind(user.id)
-            .execute(&state.db)
-            .await?;
-            if result.rows_affected() == 1 {
-                Ok(user)
-            } else {
-                Err(AuthError::bad_request(
-                    "login challenge expired or is no longer pending",
-                ))
-            }
-        }
+        Ok(user) => Ok(user),
         Err(error) => {
             let _ = sqlx::query(
                 "update steam_login_challenges
@@ -641,41 +951,29 @@ fn steam_id_from_openid_claim(query: &HashMap<String, String>) -> AuthResult<Str
     Ok(steam_id.to_string())
 }
 
-async fn find_or_create_steam_user(state: &AppState, steam_id: &str) -> AuthResult<UserSummary> {
-    let profile = steam_profile(state, steam_id).await;
-    let mut tx = state.db.begin().await?;
-    if let Some(row) = sqlx::query(
-        "select u.id, u.display_name, u.avatar_url
-         from identities i
-         join users u on u.id = i.user_id
-         where i.provider = 'steam' and i.provider_user_id = $1",
-    )
-    .bind(steam_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    {
-        let user = UserSummary {
-            id: row.try_get("id")?,
-            display_name: row.try_get("display_name")?,
-            avatar_url: row.try_get("avatar_url")?,
-        };
-        update_steam_profile(&mut tx, user.id, steam_id, &profile).await?;
-        tx.commit().await?;
-        return Ok(UserSummary {
-            display_name: profile.display_name,
-            avatar_url: profile.avatar_url,
-            ..user
-        });
+async fn find_or_create_steam_user(
+    tx: &mut Transaction<'_, Postgres>,
+    steam_id: &str,
+    profile: Option<&SteamProfile>,
+) -> AuthResult<UserSummary> {
+    if let Some((user, active)) = steam_identity_user_for_update(tx, steam_id).await? {
+        if !active {
+            return Err(AuthError::unauthorized("account is unavailable"));
+        }
+        return refresh_steam_user(tx, user, steam_id, profile).await;
     }
 
+    let new_profile = profile
+        .cloned()
+        .unwrap_or_else(|| fallback_steam_profile(steam_id));
     let row = sqlx::query(
         "insert into users (display_name, avatar_url)
          values ($1, $2)
          returning id, display_name, avatar_url",
     )
-    .bind(&profile.display_name)
-    .bind(&profile.avatar_url)
-    .fetch_one(&mut *tx)
+    .bind(&new_profile.display_name)
+    .bind(&new_profile.avatar_url)
+    .fetch_one(&mut **tx)
     .await?;
     let user = UserSummary {
         id: row.try_get("id")?,
@@ -683,49 +981,129 @@ async fn find_or_create_steam_user(state: &AppState, steam_id: &str) -> AuthResu
         avatar_url: row.try_get("avatar_url")?,
     };
 
-    sqlx::query(
+    let inserted_identity = sqlx::query(
         "insert into identities (
             user_id,
             provider,
             provider_user_id,
             provider_display_name,
             provider_avatar_url
-         ) values ($1, 'steam', $2, $3, $4)",
+         ) values ($1, 'steam', $2, $3, $4)
+         on conflict (provider, provider_user_id) do nothing
+         returning user_id",
     )
     .bind(user.id)
     .bind(steam_id)
-    .bind(&profile.display_name)
-    .bind(&profile.avatar_url)
-    .execute(&mut *tx)
+    .bind(&new_profile.display_name)
+    .bind(&new_profile.avatar_url)
+    .fetch_optional(&mut **tx)
     .await?;
-    tx.commit().await?;
+    if inserted_identity.is_some() {
+        return Ok(user);
+    }
 
-    Ok(user)
+    // A concurrent callback created the identity first. Remove the unreferenced contender.
+    sqlx::query("delete from users where id = $1")
+        .bind(user.id)
+        .execute(&mut **tx)
+        .await?;
+    let Some((user, active)) = steam_identity_user_for_update(tx, steam_id).await? else {
+        return Err(AuthError::internal("Steam identity conflict was not found"));
+    };
+    if !active {
+        return Err(AuthError::unauthorized("account is unavailable"));
+    }
+    refresh_steam_user(tx, user, steam_id, profile).await
+}
+
+async fn steam_identity_user_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    steam_id: &str,
+) -> Result<Option<(UserSummary, bool)>, sqlx::Error> {
+    let Some(row) = sqlx::query(
+        "select
+            u.id,
+            u.display_name,
+            u.avatar_url,
+            u.banned_at is null
+              and (u.suspended_until is null or u.suspended_until <= now()) as active
+         from identities i
+         join users u on u.id = i.user_id
+         where i.provider = 'steam' and i.provider_user_id = $1
+         for update of i, u",
+    )
+    .bind(steam_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        UserSummary {
+            id: row.try_get("id")?,
+            display_name: row.try_get("display_name")?,
+            avatar_url: row.try_get("avatar_url")?,
+        },
+        row.try_get("active")?,
+    )))
+}
+
+async fn refresh_steam_user(
+    tx: &mut Transaction<'_, Postgres>,
+    user: UserSummary,
+    steam_id: &str,
+    profile: Option<&SteamProfile>,
+) -> AuthResult<UserSummary> {
+    let Some(profile) = profile else {
+        sqlx::query("update users set last_seen_at = now() where id = $1")
+            .bind(user.id)
+            .execute(&mut **tx)
+            .await?;
+        return Ok(user);
+    };
+    update_steam_profile(tx, user.id, steam_id, profile).await
 }
 
 async fn find_or_create_dev_user(
     tx: &mut Transaction<'_, Postgres>,
-    provider_user_id: &str,
-    display_name: &str,
-) -> AuthResult<UserSummary> {
+    account: &DevLoginAccount,
+) -> Result<UserSummary, sqlx::Error> {
+    let provider_user_id = dev_provider_user_id(&account.account_id);
     if let Some(row) = sqlx::query(
-        "select u.id, u.display_name, u.avatar_url
+        "select
+             u.id,
+             u.display_name,
+             u.avatar_url,
+             exists (
+                 select 1
+                 from identities steam_identity
+                 where steam_identity.user_id = u.id
+                   and steam_identity.provider = 'steam'
+             ) as has_steam_identity
          from identities i
-         join users u on u.id = i.user_id
+          join users u on u.id = i.user_id
          where i.provider = 'dev' and i.provider_user_id = $1",
     )
-    .bind(provider_user_id)
+    .bind(&provider_user_id)
     .fetch_optional(&mut **tx)
     .await?
     {
         let id = row.try_get("id")?;
+        if row.try_get("has_steam_identity")? {
+            return Ok(UserSummary {
+                id,
+                display_name: row.try_get("display_name")?,
+                avatar_url: row.try_get("avatar_url")?,
+            });
+        }
         sqlx::query(
             "update users
-             set display_name = $2, last_seen_at = now()
-             where id = $1",
+              set display_name = $2, role = $3, last_seen_at = now()
+              where id = $1",
         )
         .bind(id)
-        .bind(display_name)
+        .bind(&account.display_name)
+        .bind(user_role_as_db(account.role))
         .execute(&mut **tx)
         .await?;
 
@@ -734,24 +1112,25 @@ async fn find_or_create_dev_user(
              set provider_display_name = $2, updated_at = now()
              where provider = 'dev' and provider_user_id = $1",
         )
-        .bind(provider_user_id)
-        .bind(display_name)
+        .bind(&provider_user_id)
+        .bind(&account.display_name)
         .execute(&mut **tx)
         .await?;
 
         return Ok(UserSummary {
             id,
-            display_name: display_name.to_string(),
+            display_name: account.display_name.clone(),
             avatar_url: row.try_get("avatar_url")?,
         });
     }
 
     let row = sqlx::query(
-        "insert into users (display_name)
-         values ($1)
+        "insert into users (display_name, role)
+         values ($1, $2)
          returning id, display_name, avatar_url",
     )
-    .bind(display_name)
+    .bind(&account.display_name)
+    .bind(user_role_as_db(account.role))
     .fetch_one(&mut **tx)
     .await?;
     let user = UserSummary {
@@ -765,8 +1144,8 @@ async fn find_or_create_dev_user(
          values ($1, 'dev', $2, $3)",
     )
     .bind(user.id)
-    .bind(provider_user_id)
-    .bind(display_name)
+    .bind(&provider_user_id)
+    .bind(&account.display_name)
     .execute(&mut **tx)
     .await?;
 
@@ -778,10 +1157,12 @@ async fn update_steam_profile(
     user_id: Uuid,
     steam_id: &str,
     profile: &SteamProfile,
-) -> AuthResult<()> {
+) -> AuthResult<UserSummary> {
     sqlx::query(
         "update identities
-         set provider_display_name = $3, provider_avatar_url = $4, updated_at = now()
+         set provider_display_name = $3,
+             provider_avatar_url = coalesce($4, provider_avatar_url),
+             updated_at = now()
          where provider = 'steam' and provider_user_id = $2 and user_id = $1",
     )
     .bind(user_id)
@@ -791,35 +1172,42 @@ async fn update_steam_profile(
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(
+    let row = sqlx::query(
         "update users
-         set display_name = $2, avatar_url = $3, last_seen_at = now()
-         where id = $1",
+         set display_name = $2,
+             avatar_url = coalesce($3, avatar_url),
+             last_seen_at = now()
+         where id = $1
+         returning id, display_name, avatar_url",
     )
     .bind(user_id)
     .bind(&profile.display_name)
     .bind(&profile.avatar_url)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
 
-    Ok(())
+    Ok(UserSummary {
+        id: row.try_get("id")?,
+        display_name: row.try_get("display_name")?,
+        avatar_url: row.try_get("avatar_url")?,
+    })
 }
 
-async fn steam_profile(state: &AppState, steam_id: &str) -> SteamProfile {
-    let fallback = || SteamProfile {
-        display_name: format!("Steam {steam_id}"),
-        avatar_url: None,
-    };
-
+async fn steam_profile(state: &AppState, steam_id: &str) -> Option<SteamProfile> {
     if let Some(api_key) = state.config.steam_web_api_key.as_ref() {
         if let Some(profile) = steam_web_api_profile(state, steam_id, api_key).await {
-            return profile;
+            return Some(profile);
         }
     }
 
-    steam_community_profile(state, steam_id)
-        .await
-        .unwrap_or_else(fallback)
+    steam_community_profile(state, steam_id).await
+}
+
+fn fallback_steam_profile(steam_id: &str) -> SteamProfile {
+    SteamProfile {
+        display_name: format!("Steam {steam_id}"),
+        avatar_url: None,
+    }
 }
 
 async fn steam_web_api_profile(
@@ -841,9 +1229,11 @@ async fn steam_web_api_profile(
                 .players
                 .into_iter()
                 .next()
-                .map(|player| SteamProfile {
-                    display_name: non_empty_or(player.personaname, format!("Steam {steam_id}")),
-                    avatar_url: player.avatarfull.or(player.avatarmedium).or(player.avatar),
+                .and_then(|player| {
+                    steam_profile_from_parts(
+                        player.personaname,
+                        player.avatarfull.or(player.avatarmedium).or(player.avatar),
+                    )
                 }),
             Err(error) => {
                 warn!(%error, "failed to parse Steam profile response");
@@ -867,7 +1257,7 @@ async fn steam_community_profile(state: &AppState, steam_id: &str) -> Option<Ste
 
     match response {
         Ok(response) if response.status().is_success() => match response.text().await {
-            Ok(body) => Some(parse_steam_community_profile(steam_id, &body)),
+            Ok(body) => parse_steam_community_profile(&body),
             Err(error) => {
                 warn!(%error, "failed to read Steam community profile response");
                 None
@@ -884,13 +1274,24 @@ async fn steam_community_profile(state: &AppState, steam_id: &str) -> Option<Ste
     }
 }
 
-fn parse_steam_community_profile(steam_id: &str, xml: &str) -> SteamProfile {
-    SteamProfile {
-        display_name: non_empty_or(xml_tag_text(xml, "steamID"), format!("Steam {steam_id}")),
-        avatar_url: xml_tag_text(xml, "avatarFull")
+fn steam_profile_from_parts(
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+) -> Option<SteamProfile> {
+    let display_name = display_name?.trim().to_string();
+    (!display_name.is_empty()).then_some(SteamProfile {
+        display_name,
+        avatar_url,
+    })
+}
+
+fn parse_steam_community_profile(xml: &str) -> Option<SteamProfile> {
+    steam_profile_from_parts(
+        xml_tag_text(xml, "steamID"),
+        xml_tag_text(xml, "avatarFull")
             .or_else(|| xml_tag_text(xml, "avatarMedium"))
             .or_else(|| xml_tag_text(xml, "avatarIcon")),
-    }
+    )
 }
 
 fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
@@ -921,34 +1322,58 @@ async fn create_session(
     state: &AppState,
     tx: &mut Transaction<'_, Postgres>,
     user: UserSummary,
+    source: SessionSource,
 ) -> AuthResult<AuthSession> {
+    let Some(user) = active_user_for_session_tx(tx, user.id).await? else {
+        return Err(AuthError::unauthorized("account is unavailable"));
+    };
     let tokens = session_tokens(state)?;
-    sqlx::query(
+    let session_family_id = Uuid::new_v4();
+    let row = sqlx::query(
         "insert into sessions (
             user_id,
             refresh_token_hash,
             access_token_hash,
             access_token_expires_at,
             expires_at,
-            last_used_at
+            absolute_expires_at,
+            last_used_at,
+            auth_source,
+            session_family_id
          ) values (
             $1,
             $2,
             $3,
-            now() + make_interval(secs => $4),
-            now() + make_interval(secs => $5),
-            now()
-         )",
+            least(
+                now() + make_interval(secs => $4),
+                now() + make_interval(secs => $6)
+            ),
+            least(
+                now() + make_interval(secs => $5),
+                now() + make_interval(secs => $6)
+            ),
+            now() + make_interval(secs => $6),
+            now(),
+            $7,
+            $8
+         )
+         returning greatest(
+             1,
+             extract(epoch from (access_token_expires_at - now()))::bigint
+         ) as access_token_ttl_seconds",
     )
     .bind(user.id)
     .bind(&tokens.refresh_hash)
     .bind(&tokens.access_hash)
     .bind(ACCESS_TOKEN_EXPIRES_SECONDS as i32)
     .bind(REFRESH_TOKEN_EXPIRES_SECONDS as i32)
-    .execute(&mut **tx)
+    .bind(ABSOLUTE_SESSION_EXPIRES_SECONDS as i32)
+    .bind(source.as_db())
+    .bind(session_family_id)
+    .fetch_one(&mut **tx)
     .await?;
 
-    Ok(tokens.into_session(user))
+    Ok(tokens.into_session(user, row.try_get("access_token_ttl_seconds")?))
 }
 
 async fn rotate_session(
@@ -958,24 +1383,139 @@ async fn rotate_session(
     user: UserSummary,
 ) -> AuthResult<AuthSession> {
     let tokens = session_tokens(state)?;
-    sqlx::query(
+    let rotated = sqlx::query(
         "update sessions
-         set refresh_token_hash = $2,
-             access_token_hash = $3,
-             access_token_expires_at = now() + make_interval(secs => $4),
-             expires_at = now() + make_interval(secs => $5),
-             last_used_at = now()
-         where id = $1",
+         set refresh_token_used_at = now(), last_used_at = now()
+         where id = $1
+           and refresh_token_used_at is null
+           and revoked_at is null
+         returning id",
+    )
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if rotated.is_none() {
+        return Err(AuthError::unauthorized("session is invalid or expired"));
+    }
+
+    let Some(row) = sqlx::query(
+        "insert into sessions (
+            user_id,
+            refresh_token_hash,
+            access_token_hash,
+            access_token_expires_at,
+            expires_at,
+            absolute_expires_at,
+            last_used_at,
+            auth_source,
+            session_family_id
+         )
+         select
+            s.user_id,
+            $2,
+            $3,
+            least(
+                now() + make_interval(secs => $4),
+                s.absolute_expires_at
+            ),
+            least(
+                now() + make_interval(secs => $5),
+                s.absolute_expires_at
+            ),
+            s.absolute_expires_at,
+            now(),
+            s.auth_source,
+            s.session_family_id
+         from sessions s
+         where s.id = $1 and s.absolute_expires_at > now()
+         returning greatest(
+             1,
+             extract(epoch from (access_token_expires_at - now()))::bigint
+         ) as access_token_ttl_seconds",
     )
     .bind(session_id)
     .bind(&tokens.refresh_hash)
     .bind(&tokens.access_hash)
     .bind(ACCESS_TOKEN_EXPIRES_SECONDS as i32)
     .bind(REFRESH_TOKEN_EXPIRES_SECONDS as i32)
-    .execute(&mut **tx)
-    .await?;
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Err(AuthError::unauthorized("session is invalid or expired"));
+    };
 
-    Ok(tokens.into_session(user))
+    Ok(tokens.into_session(user, row.try_get("access_token_ttl_seconds")?))
+}
+
+async fn active_user_for_session_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<Option<UserSummary>, sqlx::Error> {
+    Ok(user_for_session_update_tx(tx, user_id)
+        .await?
+        .and_then(|(user, active)| active.then_some(user)))
+}
+
+async fn user_for_session_update_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<Option<(UserSummary, bool)>, sqlx::Error> {
+    let Some(row) = sqlx::query(
+        "select
+            id,
+            display_name,
+            avatar_url,
+            banned_at is null
+              and (suspended_until is null or suspended_until <= now()) as active
+         from users
+         where id = $1
+         for update",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let active: bool = row.try_get("active")?;
+    let user = UserSummary {
+        id: row.try_get("id")?,
+        display_name: row.try_get("display_name")?,
+        avatar_url: row.try_get("avatar_url")?,
+    };
+    Ok(Some((user, active)))
+}
+
+async fn revoke_session_family_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_family_id: Uuid,
+) -> AuthResult<Vec<Uuid>> {
+    let rows = sqlx::query(
+        "update sessions
+         set revoked_at = now()
+         where session_family_id = $1 and revoked_at is null
+         returning id",
+    )
+    .bind(session_family_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.iter()
+        .map(|row| row.try_get("id").map_err(AuthError::from))
+        .collect()
+}
+
+async fn session_family_token_count_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_family_id: Uuid,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("select count(*) from sessions where session_family_id = $1")
+        .bind(session_family_id)
+        .fetch_one(&mut **tx)
+        .await
+}
+
+fn session_family_at_capacity(token_count: i64) -> bool {
+    token_count >= MAX_SESSION_FAMILY_TOKENS
 }
 
 fn session_tokens(state: &AppState) -> AuthResult<SessionTokens> {
@@ -997,11 +1537,11 @@ struct SessionTokens {
 }
 
 impl SessionTokens {
-    fn into_session(self, user: UserSummary) -> AuthSession {
+    fn into_session(self, user: UserSummary, access_token_ttl_seconds: i64) -> AuthSession {
         AuthSession {
             access_token: self.access_token,
             refresh_token: self.refresh_token,
-            expires_in_seconds: ACCESS_TOKEN_EXPIRES_SECONDS,
+            expires_in_seconds: access_token_ttl_seconds.max(1) as u64,
             user,
         }
     }
@@ -1014,6 +1554,48 @@ async fn expire_old_login_challenges(state: &AppState) -> AuthResult<()> {
          where status = 'pending' and expires_at <= now()",
     )
     .execute(&state.db)
+    .await?;
+    opportunistic_auth_cleanup(state).await;
+    Ok(())
+}
+
+async fn opportunistic_auth_cleanup(state: &AppState) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let last_cleanup = LAST_AUTH_CLEANUP_UNIX_SECONDS.load(Ordering::Relaxed);
+    if now.saturating_sub(last_cleanup) < AUTH_CLEANUP_INTERVAL_SECONDS
+        || LAST_AUTH_CLEANUP_UNIX_SECONDS
+            .compare_exchange(last_cleanup, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    if let Err(error) = delete_expired_auth_records(&state.db).await {
+        LAST_AUTH_CLEANUP_UNIX_SECONDS.store(0, Ordering::Relaxed);
+        warn!(%error, "failed to clean up expired auth records");
+    }
+}
+
+async fn delete_expired_auth_records(db: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "delete from steam_login_challenges
+         where expires_at <= now() - make_interval(secs => $1)",
+    )
+    .bind(LOGIN_CHALLENGE_RETENTION_SECONDS as i32)
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "delete from sessions
+         where absolute_expires_at <= now()
+             or (
+                 revoked_at is not null
+                and revoked_at <= now() - make_interval(secs => $1)
+            )",
+    )
+    .bind(AUTH_RECORD_RETENTION_SECONDS as i32)
+    .execute(db)
     .await?;
     Ok(())
 }
@@ -1181,7 +1763,12 @@ fn should_send_openid_realm(public_url: &str) -> bool {
         return false;
     };
     match url.host_str() {
-        Some("localhost") | Some("127.0.0.1") | Some("::1") => false,
+        Some(host)
+            if host.eq_ignore_ascii_case("localhost")
+                || matches!(host, "127.0.0.1" | "::1" | "[::1]") =>
+        {
+            false
+        }
         Some(_) => true,
         None => false,
     }
@@ -1214,28 +1801,8 @@ fn token_hash(token: &str, secret: &str) -> AuthResult<String> {
     Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
 
-fn non_empty_or(value: Option<String>, fallback: String) -> String {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback)
-}
-
-fn normalize_dev_display_name(value: Option<&str>) -> AuthResult<String> {
-    let value = value.unwrap_or("Local Developer").trim();
-    if value.is_empty() {
-        return Err(AuthError::bad_request("display name cannot be empty"));
-    }
-    if value.chars().count() > 32 {
-        return Err(AuthError::bad_request(
-            "display name cannot exceed 32 characters",
-        ));
-    }
-    Ok(value.to_string())
-}
-
-fn dev_provider_user_id(display_name: &str) -> String {
-    format!("local:{}", display_name.trim().to_ascii_lowercase())
+fn dev_provider_user_id(account_id: &str) -> String {
+    format!("local:{account_id}")
 }
 
 fn html_escape(text: &str) -> String {
@@ -1338,6 +1905,72 @@ impl From<sqlx::Error> for AuthError {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "postgres-tests")]
+    use std::sync::Arc;
+
+    #[cfg(feature = "postgres-tests")]
+    use sqlx::PgPool;
+
+    #[cfg(feature = "postgres-tests")]
+    fn auth_test_config(
+        enable_dev_login: bool,
+        dev_login_accounts: Vec<DevLoginAccount>,
+    ) -> crate::Config {
+        crate::Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: "http://localhost:8080".to_string(),
+            database_url: "postgres://unused".to_string(),
+            database_max_connections: 5,
+            minimum_client_version: "0.5.0".to_string(),
+            run_migrations: false,
+            session_secret: "test-session-secret-with-enough-length".to_string(),
+            steam_web_api_key: None,
+            enable_dev_login,
+            dev_login_accounts,
+            dev_login_proxy_token: None,
+            trusted_proxy_cidrs: Vec::new(),
+            websocket_max_connections: 8,
+        }
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    fn auth_test_state(db: PgPool) -> AppState {
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        AppState {
+            config: Arc::new(auth_test_config(false, Vec::new())),
+            db,
+            http: reqwest::Client::new(),
+            chat_tx: chat::broadcast_channel(),
+            realtime_access: Arc::new(chat::RealtimeAccess::new()),
+            realtime_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+            direct_message_delivery_locks: Arc::new(chat::DirectMessageDeliveryLocks::new()),
+            visibility_epoch: Arc::new(AtomicU64::new(0)),
+            presence: Arc::new(crate::presence::PresenceTracker::new()),
+            rate_limits: Arc::new(crate::rate_limit::RateLimiters::new()),
+            websocket_connections: Arc::new(tokio::sync::Semaphore::new(8)),
+            snapshot_delivery: Arc::new(chat::SnapshotDelivery::new()),
+            shutdown,
+        }
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    async fn insert_auth_test_user(pool: &PgPool, display_name: &str) -> UserSummary {
+        let row = sqlx::query(
+            "insert into users (display_name, avatar_url)
+             values ($1, 'https://avatars.example/original.png')
+             returning id, display_name, avatar_url",
+        )
+        .bind(display_name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        UserSummary {
+            id: row.try_get("id").unwrap(),
+            display_name: row.try_get("display_name").unwrap(),
+            avatar_url: row.try_get("avatar_url").unwrap(),
+        }
+    }
+
     #[test]
     fn extracts_steam_id_from_claimed_id() {
         let mut query = HashMap::new();
@@ -1395,6 +2028,7 @@ mod tests {
 
         assert!(!url.contains("openid.realm"));
         assert!(url.contains("openid.return_to"));
+        assert!(!should_send_openid_realm("http://[::1]:8080"));
     }
 
     #[test]
@@ -1417,14 +2051,14 @@ mod tests {
     #[test]
     fn parses_steam_community_profile_name_and_avatar() {
         let profile = parse_steam_community_profile(
-            "76561198000000000",
             r#"
             <profile>
                 <steamID><![CDATA[Ark & Zeus]]></steamID>
                 <avatarFull><![CDATA[https://avatars.steamstatic.com/full.jpg]]></avatarFull>
             </profile>
             "#,
-        );
+        )
+        .unwrap();
 
         assert_eq!(profile.display_name, "Ark & Zeus");
         assert_eq!(
@@ -1434,16 +2068,14 @@ mod tests {
     }
 
     #[test]
-    fn steam_community_profile_falls_back_to_steam_id_when_name_is_missing() {
-        let profile = parse_steam_community_profile(
-            "76561198000000000",
+    fn incomplete_steam_profile_does_not_replace_an_existing_profile() {
+        assert!(parse_steam_community_profile(
             r#"<profile><avatarMedium>https://avatars.steamstatic.com/medium.jpg</avatarMedium></profile>"#,
-        );
-
-        assert_eq!(profile.display_name, "Steam 76561198000000000");
+        )
+        .is_none());
         assert_eq!(
-            profile.avatar_url,
-            Some("https://avatars.steamstatic.com/medium.jpg".to_string())
+            fallback_steam_profile("76561198000000000").display_name,
+            "Steam 76561198000000000"
         );
     }
 
@@ -1495,13 +2127,132 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_dev_display_name() {
+    fn local_dev_provider_ids_use_configured_account_ids() {
+        assert_eq!(dev_provider_user_id("alice"), "local:alice");
+        assert_eq!(dev_provider_user_id("staff_admin"), "local:staff_admin");
+    }
+
+    #[test]
+    fn serializes_configured_local_dev_roles() {
+        assert_eq!(user_role_as_db(UserRole::User), "user");
+        assert_eq!(user_role_as_db(UserRole::Moderator), "moderator");
+        assert_eq!(user_role_as_db(UserRole::Admin), "admin");
+        assert_eq!(user_role_as_db(UserRole::Owner), "owner");
+    }
+
+    #[test]
+    fn local_test_sessions_require_an_enabled_configured_fixture() {
+        let accounts = vec![DevLoginAccount {
+            account_id: "admin".to_string(),
+            display_name: "Admin".to_string(),
+            role: UserRole::Admin,
+        }];
+
         assert_eq!(
-            normalize_dev_display_name(Some(" Alice ")).unwrap(),
-            "Alice"
+            local_test_role(true, &accounts, Some("local:admin")),
+            Some(UserRole::Admin)
         );
-        assert_eq!(normalize_dev_display_name(None).unwrap(), "Local Developer");
-        assert!(normalize_dev_display_name(Some("   ")).is_err());
+        assert_eq!(
+            local_test_role(true, &accounts, Some("local:removed")),
+            None
+        );
+        assert_eq!(local_test_role(false, &accounts, Some("local:admin")), None);
+    }
+
+    #[test]
+    fn session_family_token_capacity_is_bounded() {
+        assert_eq!(
+            MAX_SESSION_FAMILY_TOKENS,
+            (ABSOLUTE_SESSION_EXPIRES_SECONDS / MIN_REFRESH_ROTATION_INTERVAL_SECONDS) as i64 + 1
+        );
+        assert!(!session_family_at_capacity(MAX_SESSION_FAMILY_TOKENS - 1));
+        assert!(session_family_at_capacity(MAX_SESSION_FAMILY_TOKENS));
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn disabled_local_dev_reconciliation_does_not_change_roles(pool: PgPool) {
+        let user = insert_auth_test_user(&pool, "disabled-dev-reconciliation").await;
+        sqlx::query("update users set role = 'admin' where id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "insert into identities (user_id, provider, provider_user_id)
+             values ($1, 'dev', 'local:retired')",
+        )
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        reconcile_local_test_accounts(&pool, &auth_test_config(false, Vec::new()))
+            .await
+            .unwrap();
+
+        let role = sqlx::query_scalar::<_, String>("select role from users where id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(role, "admin");
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn local_dev_reconciliation_preserves_steam_user_roles(pool: PgPool) {
+        let configured = insert_auth_test_user(&pool, "Steam Configured").await;
+        let retired = insert_auth_test_user(&pool, "Steam Retired").await;
+        for (user, dev_id, steam_id) in [
+            (configured.id, "local:alice", "76561198000000011"),
+            (retired.id, "local:retired", "76561198000000012"),
+        ] {
+            sqlx::query("update users set role = 'admin' where id = $1")
+                .bind(user)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "insert into identities (user_id, provider, provider_user_id)
+                 values ($1, 'dev', $2), ($1, 'steam', $3)",
+            )
+            .bind(user)
+            .bind(dev_id)
+            .bind(steam_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        reconcile_local_test_accounts(
+            &pool,
+            &auth_test_config(
+                true,
+                vec![DevLoginAccount {
+                    account_id: "alice".to_string(),
+                    display_name: "Alice".to_string(),
+                    role: UserRole::User,
+                }],
+            ),
+        )
+        .await
+        .unwrap();
+
+        let users = sqlx::query_as::<_, (String, String)>(
+            "select display_name, role from users where id = any($1) order by display_name",
+        )
+        .bind(vec![configured.id, retired.id])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            users,
+            vec![
+                ("Steam Configured".to_string(), "admin".to_string()),
+                ("Steam Retired".to_string(), "admin".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1520,5 +2271,512 @@ mod tests {
 
         headers.insert(header::AUTHORIZATION, "Basic token".parse().unwrap());
         assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refresh_token_reuse_revokes_the_entire_family_and_notifies(pool: PgPool) {
+        let state = auth_test_state(pool.clone());
+        let user = insert_auth_test_user(&pool, "refresh-user").await;
+        let initial = {
+            let mut tx = pool.begin().await.unwrap();
+            let session = create_session(&state, &mut tx, user.clone(), SessionSource::Steam)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            session
+        };
+        sqlx::query(
+            "update sessions
+             set created_at = now() - interval '6 minutes', last_used_at = now()
+             where refresh_token_hash = $1",
+        )
+        .bind(token_hash(&initial.refresh_token, &state.config.session_secret).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let peer_addr = "127.0.0.1:4000".parse().unwrap();
+        let axum::Json(first_rotation) = refresh(
+            axum::extract::State(state.clone()),
+            axum::extract::ConnectInfo(peer_addr),
+            HeaderMap::new(),
+            axum::Json(RefreshRequest {
+                refresh_token: initial.refresh_token.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first_rotation.session.refresh_token, initial.refresh_token);
+
+        let mut notifications = state.chat_tx.subscribe();
+        let replay = refresh(
+            axum::extract::State(state.clone()),
+            axum::extract::ConnectInfo(peer_addr),
+            HeaderMap::new(),
+            axum::Json(RefreshRequest {
+                refresh_token: initial.refresh_token,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(replay.status, StatusCode::UNAUTHORIZED);
+
+        let (members, revoked, used, shared_absolute_expiry) =
+            sqlx::query_as::<_, (i64, i64, i64, bool)>(
+                "select
+                 count(*),
+                 count(*) filter (where revoked_at is not null),
+                 count(*) filter (where refresh_token_used_at is not null),
+                 min(absolute_expires_at) = max(absolute_expires_at)
+             from sessions
+             where user_id = $1",
+            )
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((members, revoked, used), (2, 2, 1));
+        assert!(shared_absolute_expiry);
+        assert!(notifications.try_recv().is_ok());
+        assert!(notifications.try_recv().is_ok());
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refresh_rotation_requires_a_minimum_interval(pool: PgPool) {
+        let state = auth_test_state(pool.clone());
+        let user = insert_auth_test_user(&pool, "refresh-interval-user").await;
+        let initial = {
+            let mut tx = pool.begin().await.unwrap();
+            let session = create_session(&state, &mut tx, user, SessionSource::Steam)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            session
+        };
+
+        let error = refresh(
+            axum::extract::State(state.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:4003".parse().unwrap()),
+            HeaderMap::new(),
+            axum::Json(RefreshRequest {
+                refresh_token: initial.refresh_token.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        let used = sqlx::query_scalar::<_, bool>(
+            "select refresh_token_used_at is not null
+             from sessions
+             where refresh_token_hash = $1",
+        )
+        .bind(token_hash(&initial.refresh_token, &state.config.session_secret).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!used);
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refresh_tombstone_replay_revokes_an_active_family(pool: PgPool) {
+        let state = auth_test_state(pool.clone());
+        let user = insert_auth_test_user(&pool, "refresh-tombstone-user").await;
+        let initial = {
+            let mut tx = pool.begin().await.unwrap();
+            let session = create_session(&state, &mut tx, user.clone(), SessionSource::Steam)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            session
+        };
+        let initial_hash =
+            token_hash(&initial.refresh_token, &state.config.session_secret).unwrap();
+        sqlx::query(
+            "update sessions
+             set created_at = now() - interval '6 minutes'
+             where refresh_token_hash = $1",
+        )
+        .bind(&initial_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let axum::Json(_) = refresh(
+            axum::extract::State(state.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:4004".parse().unwrap()),
+            HeaderMap::new(),
+            axum::Json(RefreshRequest {
+                refresh_token: initial.refresh_token.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "update sessions
+             set refresh_token_used_at = now() - interval '31 days'
+             where refresh_token_hash = $1",
+        )
+        .bind(&initial_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        delete_expired_auth_records(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from sessions where refresh_token_hash = $1",
+            )
+            .bind(&initial_hash)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        let replay = refresh(
+            axum::extract::State(state),
+            axum::extract::ConnectInfo("127.0.0.1:4004".parse().unwrap()),
+            HeaderMap::new(),
+            axum::Json(RefreshRequest {
+                refresh_token: initial.refresh_token,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(replay.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from sessions where user_id = $1 and revoked_at is not null",
+            )
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refresh_cannot_extend_an_absolute_session_expiry(pool: PgPool) {
+        let state = auth_test_state(pool.clone());
+        let user = insert_auth_test_user(&pool, "absolute-expiry-user").await;
+        let initial = {
+            let mut tx = pool.begin().await.unwrap();
+            let session = create_session(&state, &mut tx, user.clone(), SessionSource::Steam)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            session
+        };
+        let refresh_hash =
+            token_hash(&initial.refresh_token, &state.config.session_secret).unwrap();
+        sqlx::query(
+            "update sessions
+             set absolute_expires_at = now() - interval '1 second'
+             where refresh_token_hash = $1",
+        )
+        .bind(refresh_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let denied = refresh(
+            axum::extract::State(state),
+            axum::extract::ConnectInfo("127.0.0.1:4001".parse().unwrap()),
+            HeaderMap::new(),
+            axum::Json(RefreshRequest {
+                refresh_token: initial.refresh_token,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+        let sessions =
+            sqlx::query_scalar::<_, i64>("select count(*) from sessions where user_id = $1")
+                .bind(user.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sessions, 0);
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn failed_steam_profile_lookup_preserves_existing_user_profile(pool: PgPool) {
+        let user = insert_auth_test_user(&pool, "Stored Steam Name").await;
+        let steam_id = "76561198000000001";
+        sqlx::query(
+            "insert into identities (
+                user_id,
+                provider,
+                provider_user_id,
+                provider_display_name,
+                provider_avatar_url
+             ) values ($1, 'steam', $2, 'Stored Steam Name', 'https://avatars.example/original.png')",
+        )
+        .bind(user.id)
+        .bind(steam_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let returned = find_or_create_steam_user(&mut tx, steam_id, None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(returned, user);
+        let stored = sqlx::query_as::<_, (String, Option<String>)>(
+            "select display_name, avatar_url from users where id = $1",
+        )
+        .bind(user.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.0, "Stored Steam Name");
+        assert_eq!(
+            stored.1.as_deref(),
+            Some("https://avatars.example/original.png")
+        );
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn suspended_steam_identities_are_rejected_before_completion(pool: PgPool) {
+        let user = insert_auth_test_user(&pool, "suspended-steam-user").await;
+        let steam_id = "76561198000000003";
+        sqlx::query(
+            "insert into identities (user_id, provider, provider_user_id)
+             values ($1, 'steam', $2)",
+        )
+        .bind(user.id)
+        .bind(steam_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("update users set suspended_until = now() + interval '1 hour' where id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let error = find_or_create_steam_user(&mut tx, steam_id, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn steam_identity_creation_is_idempotent_during_a_race(pool: PgPool) {
+        let steam_id = "76561198000000002".to_string();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first_pool = pool.clone();
+        let first_barrier = barrier.clone();
+        let first_steam_id = steam_id.clone();
+        let first = tokio::spawn(async move {
+            let mut tx = first_pool.begin().await.unwrap();
+            first_barrier.wait().await;
+            let user = find_or_create_steam_user(
+                &mut tx,
+                &first_steam_id,
+                Some(&SteamProfile {
+                    display_name: "Concurrent Steam User".to_string(),
+                    avatar_url: None,
+                }),
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            user.id
+        });
+        let second_pool = pool.clone();
+        let second_barrier = barrier.clone();
+        let second_steam_id = steam_id.clone();
+        let second = tokio::spawn(async move {
+            let mut tx = second_pool.begin().await.unwrap();
+            second_barrier.wait().await;
+            let user = find_or_create_steam_user(
+                &mut tx,
+                &second_steam_id,
+                Some(&SteamProfile {
+                    display_name: "Concurrent Steam User".to_string(),
+                    avatar_url: None,
+                }),
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            user.id
+        });
+        let first_user = first.await.unwrap();
+        let second_user = second.await.unwrap();
+
+        assert_eq!(first_user, second_user);
+        let identity_count = sqlx::query_scalar::<_, i64>(
+            "select count(*)
+             from identities
+             where provider = 'steam' and provider_user_id = $1",
+        )
+        .bind(steam_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let user_count = sqlx::query_scalar::<_, i64>("select count(*) from users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(identity_count, 1);
+        assert_eq!(user_count, 1);
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn restricted_users_cannot_consume_completed_steam_challenges(pool: PgPool) {
+        let state = auth_test_state(pool.clone());
+        let user = insert_auth_test_user(&pool, "restricted-user").await;
+        sqlx::query("update users set banned_at = now() where id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let poll_token = "completed-challenge-token";
+        sqlx::query(
+            "insert into steam_login_challenges (
+                id,
+                poll_token_hash,
+                status,
+                user_id,
+                expires_at,
+                completed_at
+             ) values ($1, $2, 'complete', $3, now() + interval '1 minute', now())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(token_hash(poll_token, &state.config.session_secret).unwrap())
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let axum::Json(response) = steam_login_poll(
+            axum::extract::State(state),
+            axum::extract::ConnectInfo("127.0.0.1:4002".parse().unwrap()),
+            HeaderMap::new(),
+            axum::Json(SteamLoginPollRequest {
+                poll_token: poll_token.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            response.status,
+            SteamLoginStatus::Denied { ref message } if message == "account is unavailable"
+        ));
+        let sessions =
+            sqlx::query_scalar::<_, i64>("select count(*) from sessions where user_id = $1")
+                .bind(user.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sessions, 0);
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn expired_auth_records_retain_active_refresh_tombstones(pool: PgPool) {
+        let user = insert_auth_test_user(&pool, "retention-user").await;
+        sqlx::query(
+            "insert into sessions (
+                user_id,
+                refresh_token_hash,
+                expires_at,
+                absolute_expires_at,
+                session_family_id,
+                auth_source
+             ) values (
+                $1,
+                'expired-refresh-record',
+                now() - interval '31 days',
+                now() - interval '31 days',
+                $2,
+                'steam'
+             )",
+        )
+        .bind(user.id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into steam_login_challenges (id, poll_token_hash, expires_at)
+             values ($1, 'expired-challenge-record', now() - interval '2 days')",
+        )
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into sessions (
+                user_id,
+                refresh_token_hash,
+                expires_at,
+                absolute_expires_at,
+                refresh_token_used_at,
+                session_family_id,
+                auth_source
+             ) values (
+                $1,
+                'used-refresh-record',
+                now() + interval '1 day',
+                now() + interval '1 day',
+                now() - interval '31 days',
+                $2,
+                'steam'
+             )",
+        )
+        .bind(user.id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        delete_expired_auth_records(&pool).await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from sessions where user_id = $1",)
+                .bind(user.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::query(
+            "update sessions
+             set absolute_expires_at = now() - interval '1 second'
+             where refresh_token_hash = 'used-refresh-record'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        delete_expired_auth_records(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from sessions where user_id = $1",)
+                .bind(user.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from steam_login_challenges")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
     }
 }

@@ -4,12 +4,15 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17
+        image: postgres:17.5-bookworm@sha256:fbcea1bd13b6a882cd6caa6b58db3ae5c102efe50ec625b3e2a5cbc50db5bfe4
         env:
           POSTGRES_DB: agora
           POSTGRES_USER: agora
@@ -32,4 +35,130 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace
-      - run: cargo test --locked -p agora-server --features postgres-tests --test postgres_invariants
+      - run: cargo test --locked -p agora-update-sign --features release-tool
+      - run: cargo test --locked -p agora-server --features postgres-tests -- --test-threads=1
+
+  deployment:
+    name: Deployment configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Compose files
+        run: |
+          docker compose --env-file .env.example config --quiet
+          docker compose --env-file .env.production.example -f docker-compose.prod.yml config --quiet
+
+      - name: Validate PowerShell maintenance scripts
+        shell: pwsh
+        run: |
+          $scripts = @(
+            'scripts/backup-postgres.ps1',
+            'scripts/restore-postgres.ps1',
+            'scripts/release.ps1',
+            'scripts/publish-server-image.ps1'
+          )
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $parseErrors = $null
+            [void] [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $script).Path,
+              [ref] $tokens,
+              [ref] $parseErrors
+            )
+            if ($parseErrors) {
+              throw "$script has parse errors: $($parseErrors.Message -join '; ')"
+            }
+          }
+
+      - name: Exercise PowerShell safety preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $missingChecksumRejected = $false
+          try {
+            & ./scripts/restore-postgres.ps1 -Backup LICENSE -EnvFile .env.production.example -Force -WhatIf
+          }
+          catch {
+            if ($_.Exception.Message -notmatch 'checksum sidecar.*is required') {
+              throw
+            }
+            $missingChecksumRejected = $true
+          }
+          if (-not $missingChecksumRejected) {
+            throw 'Restore accepted a missing checksum without explicit opt-in'
+          }
+
+          $invalidServerUrls = @{
+            'https://chat.example.com/path' = 'origin without a path, query, or fragment'
+            'https://chat.example.com?next=elsewhere' = 'origin without a path, query, or fragment'
+            'https://user@chat.example.com' = 'must not include credentials'
+            'http://chat.example.com' = 'must use HTTPS unless it targets a loopback host'
+          }
+          foreach ($entry in $invalidServerUrls.GetEnumerator()) {
+            $rejected = $false
+            try {
+              & ./scripts/release.ps1 -ServerUrl $entry.Key -SkipPostgresTests
+            }
+            catch {
+              if ($_.Exception.Message -notmatch [regex]::Escape($entry.Value)) {
+                throw
+              }
+              $rejected = $true
+            }
+            if (-not $rejected) {
+              throw "Release accepted invalid ServerUrl '$($entry.Key)'"
+            }
+          }
+
+          $unsupportedTargetRejected = $false
+          try {
+            & ./scripts/release.ps1 -Target x86_64-pc-windows-gnu -SkipPostgresTests
+          }
+          catch {
+            if ($_.Exception.Message -notmatch 'Target') {
+              throw
+            }
+            $unsupportedTargetRejected = $true
+          }
+          if (-not $unsupportedTargetRejected) {
+            throw 'Release accepted an updater target other than x86_64-pc-windows-msvc'
+          }
+
+          function global:docker { throw 'Docker must not run during restore WhatIf' }
+          & ./scripts/restore-postgres.ps1 -Backup LICENSE -EnvFile .env.production.example -Force -AllowUncheckedBackup -WhatIf
+
+      - name: Validate development Caddyfile
+        run: |
+          docker run --rm \
+            --env AGORA_SITE_ADDRESS=localhost:80 \
+            --env AGORA_DEV_LOGIN_PROXY_TOKEN=ci-only-proxy-token \
+            --volume "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+      - name: Validate production Caddyfile
+        run: |
+          docker run --rm \
+            --env AGORA_SITE_ADDRESS=chat.example.com \
+            --volume "$PWD/Caddyfile.production:/etc/caddy/Caddyfile:ro" \
+            caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+      - name: Build and health-check local Compose stack
+        run: |
+          docker compose --env-file .env.example up --build --wait --wait-timeout 180
+          proxy_id="$(docker compose --env-file .env.example ps -q proxy)"
+          server_id="$(docker compose --env-file .env.example ps -q server)"
+          docker inspect --format '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$proxy_id" | grep -Fx '172.30.0.2'
+          if docker inspect --format '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$server_id" | grep -Fx '172.30.0.2'; then
+            echo "server received Caddy's fixed trusted proxy address"
+            exit 1
+          fi
+          curl --fail --retry 12 --retry-connrefused --header 'Host: localhost' http://127.0.0.1/health
+
+      - name: Show Compose logs on failure
+        if: failure()
+        run: docker compose --env-file .env.example logs --no-color
+
+      - name: Stop local Compose stack
+        if: always()
+        run: docker compose --env-file .env.example down --remove-orphans

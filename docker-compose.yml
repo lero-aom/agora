@@ -1,6 +1,9 @@
+x-agora-proxy-ip: &agora_proxy_ip "172.30.0.2"
+
 services:
   proxy:
-    image: caddy:2
+    # Override only with a reviewed tag@sha256 reference when updating Caddy.
+    image: "${AGORA_CADDY_IMAGE:-caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d}"
     environment:
       AGORA_SITE_ADDRESS: ${AGORA_SITE_ADDRESS:-localhost:80}
       AGORA_DEV_LOGIN_PROXY_TOKEN: ${AGORA_DEV_LOGIN_PROXY_TOKEN:?set AGORA_DEV_LOGIN_PROXY_TOKEN}
@@ -12,7 +15,30 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - server
+      server:
+        condition: service_healthy
+    networks:
+      edge: {}
+      proxy:
+        ipv4_address: *agora_proxy_ip
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    pids_limit: ${AGORA_CADDY_PIDS_LIMIT:-128}
+    mem_limit: ${AGORA_CADDY_MEMORY_LIMIT:-256m}
+    cpus: "${AGORA_CADDY_CPU_LIMIT:-0.50}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2019/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
 
   server:
@@ -23,9 +49,11 @@ services:
       AGORA_BIND_ADDR: 0.0.0.0:8080
       AGORA_PUBLIC_URL: ${AGORA_PUBLIC_URL:-http://localhost}
       AGORA_ENABLE_DEV_LOGIN: ${AGORA_ENABLE_DEV_LOGIN:?set AGORA_ENABLE_DEV_LOGIN}
+      AGORA_DEV_LOGIN_ACCOUNTS: "${AGORA_DEV_LOGIN_ACCOUNTS:-alice:user,bob:user,reporter:user,target:user,moderator:moderator,admin:admin,owner:owner}"
       AGORA_DEV_LOGIN_PROXY_TOKEN: ${AGORA_DEV_LOGIN_PROXY_TOKEN:?set AGORA_DEV_LOGIN_PROXY_TOKEN}
-      AGORA_TRUST_PROXY_HEADERS: "true"
-      AGORA_MIN_CLIENT_VERSION: ${AGORA_MIN_CLIENT_VERSION:-0.4.0}
+      # A bare address is parsed by the server as one exact trusted proxy (/32).
+      AGORA_TRUSTED_PROXY_CIDRS: *agora_proxy_ip
+      AGORA_MIN_CLIENT_VERSION: ${AGORA_MIN_CLIENT_VERSION:-0.6.0}
       AGORA_REALTIME_MODE: ${AGORA_REALTIME_MODE:-single-replica}
       AGORA_SESSION_SECRET: ${AGORA_SESSION_SECRET:?set AGORA_SESSION_SECRET}
       AGORA_RUN_MIGRATIONS: "true"
@@ -35,10 +63,33 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      proxy: {}
+      database: {}
+      egress: {}
+    user: "10001:10001"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: ${AGORA_SERVER_PIDS_LIMIT:-256}
+    mem_limit: ${AGORA_SERVER_MEMORY_LIMIT:-512m}
+    cpus: "${AGORA_SERVER_CPU_LIMIT:-1.00}"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
     restart: unless-stopped
 
   postgres:
-    image: postgres:17
+    # PostgreSQL major upgrades require a deliberate migration plan.
+    image: "${AGORA_POSTGRES_IMAGE:-postgres:17.5-bookworm@sha256:fbcea1bd13b6a882cd6caa6b58db3ae5c102efe50ec625b3e2a5cbc50db5bfe4}"
     ports:
       - "127.0.0.1:5432:5432"
     environment:
@@ -51,10 +102,31 @@ services:
       test: ["CMD-SHELL", "pg_isready -U agora -d agora"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 12
+      start_period: 30s
+    networks:
+      - database
+    pids_limit: ${AGORA_POSTGRES_PIDS_LIMIT:-256}
+    mem_limit: ${AGORA_POSTGRES_MEMORY_LIMIT:-1g}
+    cpus: "${AGORA_POSTGRES_CPU_LIMIT:-2.00}"
+    stop_grace_period: 1m
     restart: unless-stopped
 
 volumes:
   caddy_data:
   caddy_config:
   postgres_data:
+
+networks:
+  edge:
+  proxy:
+    internal: true
+    ipam:
+      config:
+        # Dynamic endpoints cannot take Caddy's fixed, exact-trust address.
+        - subnet: 172.30.0.0/24
+          ip_range: 172.30.0.128/25
+  database:
+    internal: true
+  # The server needs outbound access for Steam OpenID and the Steam Web API.
+  egress:

@@ -299,6 +299,10 @@ async fn block_user(
         return Err(RelationshipError::bad_request("cannot block yourself"));
     }
 
+    let _direct_message_delivery = state
+        .direct_message_delivery_locks
+        .lock(user.id, target.id)
+        .await;
     let _realtime_state = state.realtime_state_lock.lock().await;
     let mut tx = state.db.begin().await?;
     lock_relationship_pair(&mut tx, user.id, target.id).await?;
@@ -348,6 +352,10 @@ async fn unblock_user(
 ) -> RelationshipResult<Json<UnblockUserResponse>> {
     check_relationship_write_limit(&state, peer_addr, &headers).await?;
     let user = current_user(&state, &headers).await?;
+    let _direct_message_delivery = state
+        .direct_message_delivery_locks
+        .lock(user.id, user_id)
+        .await;
     let _realtime_state = state.realtime_state_lock.lock().await;
     let mut tx = state.db.begin().await?;
     lock_relationship_pair(&mut tx, user.id, user_id).await?;
@@ -463,7 +471,7 @@ async fn check_relationship_read_limit(
 ) -> RelationshipResult<()> {
     state
         .rate_limits
-        .check_relationship_read(peer_addr, headers, state.config.trust_proxy_headers)
+        .check_relationship_read(peer_addr, headers, &state.config.trusted_proxy_cidrs)
         .await
         .map_err(|error| RelationshipError::too_many_requests(error.message()))
 }
@@ -475,7 +483,7 @@ async fn check_relationship_write_limit(
 ) -> RelationshipResult<()> {
     state
         .rate_limits
-        .check_relationship_write(peer_addr, headers, state.config.trust_proxy_headers)
+        .check_relationship_write(peer_addr, headers, &state.config.trusted_proxy_cidrs)
         .await
         .map_err(|error| RelationshipError::too_many_requests(error.message()))
 }

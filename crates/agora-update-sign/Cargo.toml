@@ -1,0 +1,17 @@
+[package]
+name = "agora-update-sign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agora-update-sign"
+path = "src/main.rs"
+required-features = ["release-tool"]
+
+[features]
+release-tool = []
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true

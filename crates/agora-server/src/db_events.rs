@@ -18,11 +18,20 @@ enum DatabaseNotification {
 
 pub(crate) fn spawn_database_event_listener(state: AppState) {
     tokio::spawn(async move {
+        let mut shutdown = state.shutdown.clone();
         loop {
-            if let Err(error) = run_database_event_listener(&state).await {
+            let result = tokio::select! {
+                _ = shutdown.changed() => break,
+                result = run_database_event_listener(&state) => result,
+            };
+            if let Err(error) = result {
                 warn!(%error, "database event listener failed");
             }
-            tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECONDS)).await;
+
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECONDS)) => {}
+            }
         }
     });
 }
@@ -41,14 +50,10 @@ async fn run_database_event_listener(state: &AppState) -> Result<(), sqlx::Error
 fn handle_database_notification(state: &AppState, channel: &str, payload: &str) {
     match database_notification(channel, payload) {
         Some(DatabaseNotification::SessionRevoked(session_id)) => {
-            chat::send_session_revoked(&state.chat_tx, session_id);
+            chat::send_session_revoked(state, session_id);
         }
         Some(DatabaseNotification::UserRestricted(user_id)) => {
-            chat::send_user_disconnect(
-                &state.chat_tx,
-                user_id,
-                "Account status changed; sign in again",
-            );
+            chat::send_user_disconnect(state, user_id, "Account status changed; sign in again");
         }
         None => warn!(channel, payload, "ignored database notification"),
     }

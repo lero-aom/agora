@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   checks:
     name: Rust checks
@@ -35,5 +38,41 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace
 
+      - name: Test release update signer
+        run: cargo test --locked -p agora-update-sign --features release-tool
+
       - name: Build workspace
         run: cargo build --locked --workspace
+
+      - name: Reject mismatched server image version
+        shell: pwsh
+        run: |
+          $rejected = $false
+          try {
+            & ./scripts/publish-server-image.ps1 -Version not-the-cargo-version
+          }
+          catch {
+            if ($_.Exception.Message -notmatch 'does not match agora-server package version') {
+              throw
+            }
+            $rejected = $true
+          }
+          if (-not $rejected) {
+            throw 'Image publishing accepted a version different from Cargo metadata'
+          }
+
+      - name: Package and verify release archive
+        shell: pwsh
+        env:
+          # Public test-only seed for package verification. Production signing keys are stored
+          # exclusively in the protected release environment.
+          AGORA_UPDATE_SIGNING_KEY_B64: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        run: ./scripts/release.ps1 -SkipPostgresTests
+
+      - name: Upload release-package verification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agora-windows-release-package
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

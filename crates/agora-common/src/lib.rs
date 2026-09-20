@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_MESSAGE_LEN: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,18 +11,6 @@ pub enum PresenceState {
     Online,
     LookingForGame,
     InGame,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AomState {
-    NotRunning,
-    RunningUnknown,
-    MainMenu,
-    MultiplayerMenu,
-    Lobby,
-    InMatch,
-    PostGame,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +101,7 @@ pub struct LogoutResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevLoginRequest {
-    pub display_name: Option<String>,
+    pub account_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +309,61 @@ pub struct UserSearchResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmThreadSummary {
+    pub id: Uuid,
+    pub other_user: UserSummary,
+    pub created_at: String,
+    pub last_message_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmThreadListResponse {
+    pub threads: Vec<DmThreadSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateDmThreadRequest {
+    pub recipient_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateDmThreadResponse {
+    pub thread: DmThreadSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmMessage {
+    pub id: Uuid,
+    pub thread_id: Uuid,
+    pub author: UserSummary,
+    pub body: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendDmMessageRequest {
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendDmMessageResponse {
+    pub message: DmMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmMessageHistoryResponse {
+    pub messages: Vec<DmMessage>,
+    pub next_before_message_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum DmRealtimeEvent {
+    DmThreadUpdated(DmThreadSummary),
+    DmMessageCreated(DmMessage),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: Uuid,
     pub author: UserSummary,
@@ -373,4 +416,44 @@ pub enum ServerEvent {
     Error {
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(id: u128, display_name: &str) -> UserSummary {
+        UserSummary {
+            id: Uuid::from_u128(id),
+            display_name: display_name.to_string(),
+            avatar_url: None,
+        }
+    }
+
+    #[test]
+    fn direct_message_realtime_events_preserve_thread_and_message_payloads() {
+        let thread_id = Uuid::from_u128(10);
+        let thread = DmThreadSummary {
+            id: thread_id,
+            other_user: user(2, "Bob"),
+            created_at: "2026-09-19 12:00:00+00".to_string(),
+            last_message_at: None,
+        };
+        let message = DmMessage {
+            id: Uuid::from_u128(11),
+            thread_id,
+            author: user(1, "Alice"),
+            body: "hello".to_string(),
+            created_at: "2026-09-19 12:01:00+00".to_string(),
+        };
+
+        assert!(matches!(
+            DmRealtimeEvent::DmThreadUpdated(thread.clone()),
+            DmRealtimeEvent::DmThreadUpdated(payload) if payload == thread
+        ));
+        assert!(matches!(
+            DmRealtimeEvent::DmMessageCreated(message.clone()),
+            DmRealtimeEvent::DmMessageCreated(payload) if payload == message
+        ));
+    }
 }

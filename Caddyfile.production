@@ -7,15 +7,17 @@ http://127.0.0.1:2019 {
 	reverse_proxy server:8080
 }
 
+# A DNS hostname here enables Caddy's automatic HTTPS and certificate renewal.
 {$AGORA_SITE_ADDRESS} {
 	encode zstd gzip
 	header {
 		-Server
-		Content-Security-Policy "default-src 'self'; base-uri 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+		Content-Security-Policy "default-src 'self'; base-uri 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; upgrade-insecure-requests"
 		Cross-Origin-Opener-Policy "same-origin"
 		Cross-Origin-Resource-Policy "same-origin"
 		Permissions-Policy "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
 		Referrer-Policy "no-referrer"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
 		X-Permitted-Cross-Domain-Policies "none"
@@ -26,6 +28,5 @@ http://127.0.0.1:2019 {
 		health_timeout 5s
 		header_up X-Forwarded-For {remote_host}
 		header_up X-Real-IP {remote_host}
-		header_up X-Agora-Dev-Login-Proxy {$AGORA_DEV_LOGIN_PROXY_TOKEN}
 	}
 }

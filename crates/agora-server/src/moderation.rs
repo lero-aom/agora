@@ -676,7 +676,7 @@ async fn revoke_user_sessions_tx(
 
 fn send_session_revocations(state: &AppState, session_ids: &[Uuid]) {
     for session_id in session_ids {
-        chat::send_session_revoked(&state.chat_tx, *session_id);
+        chat::send_session_revoked(state, *session_id);
     }
 }
 
