@@ -7,11 +7,12 @@ use std::{
 
 use agora_common::{
     ApiError, AuthSession, DevLoginRequest, DevLoginResponse, LogoutRequest, LogoutResponse,
-    RefreshRequest, RefreshResponse, SteamLoginPollRequest, SteamLoginPollResponse,
-    SteamLoginStartResponse, SteamLoginStatus, UserRole, UserSummary,
+    MicrosoftLoginPollRequest, MicrosoftLoginPollResponse, MicrosoftLoginStartResponse,
+    MicrosoftLoginStatus, RefreshRequest, RefreshResponse, SteamLoginPollRequest,
+    SteamLoginPollResponse, SteamLoginStartResponse, SteamLoginStatus, UserRole, UserSummary,
 };
 use axum::{
-    extract::{ConnectInfo, FromRequestParts, Query, State},
+    extract::{ConnectInfo, Form, FromRequestParts, Query, State},
     http::{header, request::Parts, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -19,6 +20,8 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
+use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use rand::{rngs::OsRng, RngCore};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -27,10 +30,18 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{chat, normalize_dev_account_id, AppState, DevLoginAccount};
+use crate::{chat, normalize_dev_account_id, AppState, DevLoginAccount, MicrosoftLoginConfig};
 
 const STEAM_OPENID_ENDPOINT: &str = "https://steamcommunity.com/openid/login";
 const STEAM_IDENTIFIER_SELECT: &str = "http://specs.openid.net/auth/2.0/identifier_select";
+const MICROSOFT_AUTHORIZE_ENDPOINT: &str =
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize";
+const MICROSOFT_TOKEN_ENDPOINT: &str =
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+const MICROSOFT_JWKS_ENDPOINT: &str =
+    "https://login.microsoftonline.com/consumers/discovery/v2.0/keys";
+const MICROSOFT_ISSUER: &str =
+    "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0";
 const LOGIN_CHALLENGE_EXPIRES_SECONDS: u64 = 10 * 60;
 const ACCESS_TOKEN_EXPIRES_SECONDS: u64 = 15 * 60;
 const REFRESH_TOKEN_EXPIRES_SECONDS: u64 = 30 * 24 * 60 * 60;
@@ -49,6 +60,7 @@ type AuthResult<T> = Result<T, AuthError>;
 #[derive(Clone, Copy)]
 enum SessionSource {
     Steam,
+    Microsoft,
     LocalTest,
 }
 
@@ -56,6 +68,7 @@ impl SessionSource {
     fn as_db(self) -> &'static str {
         match self {
             Self::Steam => "steam",
+            Self::Microsoft => "microsoft",
             Self::LocalTest => "local_test",
         }
     }
@@ -125,6 +138,9 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/auth/steam/device/start", post(steam_login_start))
         .route("/auth/steam/callback", get(steam_login_callback))
         .route("/auth/steam/device/poll", post(steam_login_poll))
+        .route("/auth/microsoft/device/start", post(microsoft_login_start))
+        .route("/auth/microsoft/callback", post(microsoft_login_callback))
+        .route("/auth/microsoft/device/poll", post(microsoft_login_poll))
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
         .route("/auth/dev/login", post(dev_login))
@@ -183,11 +199,11 @@ pub(crate) async fn reconcile_local_test_accounts(
                   and configured_dev_identity.provider = 'dev'
                   and configured_dev_identity.provider_user_id = any($1)
             )
-            and not exists (
+             and not exists (
                 select 1
-                from identities steam_identity
-                where steam_identity.user_id = u.id
-                  and steam_identity.provider = 'steam'
+                from identities non_dev_identity
+                where non_dev_identity.user_id = u.id
+                  and non_dev_identity.provider <> 'dev'
             )",
     )
     .bind(provider_user_ids)
@@ -257,7 +273,7 @@ pub(crate) async fn user_for_access_token(
     let stored_role = user_role_from_db(row.try_get::<String, _>("role")?.as_str());
     let source: String = row.try_get("auth_source")?;
     let role = match source.as_str() {
-        "steam" => stored_role,
+        "steam" | "microsoft" => stored_role,
         "local_test" => {
             let provider_user_id: Option<String> = row.try_get("dev_provider_user_id")?;
             let Some(role) = local_test_role(
@@ -371,7 +387,7 @@ pub(crate) async fn session_activity(
     };
 
     let source_is_allowed = match source.as_str() {
-        "steam" => true,
+        "steam" | "microsoft" => true,
         "local_test" => local_test_role(
             state.config.enable_dev_login,
             &state.config.dev_login_accounts,
@@ -472,7 +488,6 @@ async fn steam_login_start(
     .bind(LOGIN_CHALLENGE_EXPIRES_SECONDS as i32)
     .execute(&state.db)
     .await?;
-
     Ok(Json(SteamLoginStartResponse {
         browser_url,
         poll_token,
@@ -622,6 +637,195 @@ async fn steam_login_poll(
     }
 }
 
+async fn microsoft_login_start(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> AuthResult<Json<MicrosoftLoginStartResponse>> {
+    state
+        .rate_limits
+        .check_auth(peer_addr, &headers, &state.config.trusted_proxy_cidrs)
+        .await
+        .map_err(|error| AuthError::too_many_requests(error.message()))?;
+    expire_old_login_challenges(&state).await?;
+
+    let config = configured_microsoft_login(&state)?;
+    let poll_token = random_token();
+    let state_token = random_token();
+    let nonce = random_token();
+    let poll_token_hash = token_hash(&poll_token, &state.config.session_secret)?;
+    let state_hash = token_hash(&state_token, &state.config.session_secret)?;
+    let nonce_hash = token_hash(&nonce, &state.config.session_secret)?;
+    let browser_url = microsoft_login_url(&config, &state.config.public_url, &state_token, &nonce)?;
+
+    sqlx::query(
+        "insert into microsoft_login_challenges (
+            poll_token_hash,
+            state_hash,
+            nonce_hash,
+            expires_at
+         ) values ($1, $2, $3, now() + make_interval(secs => $4))",
+    )
+    .bind(poll_token_hash)
+    .bind(state_hash)
+    .bind(nonce_hash)
+    .bind(LOGIN_CHALLENGE_EXPIRES_SECONDS as i32)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(MicrosoftLoginStartResponse {
+        browser_url,
+        poll_token,
+        expires_in_seconds: LOGIN_CHALLENGE_EXPIRES_SECONDS,
+    }))
+}
+
+async fn microsoft_login_callback(
+    State(state): State<AppState>,
+    Form(form): Form<MicrosoftLoginCallback>,
+) -> Response {
+    match complete_microsoft_login(&state, form).await {
+        Ok(user) => Html(microsoft_login_success_page(&user.display_name)).into_response(),
+        Err(error) => (
+            error.status,
+            Html(microsoft_login_error_page(&error.message)),
+        )
+            .into_response(),
+    }
+}
+
+async fn microsoft_login_poll(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<MicrosoftLoginPollRequest>,
+) -> AuthResult<Json<MicrosoftLoginPollResponse>> {
+    state
+        .rate_limits
+        .check_auth(peer_addr, &headers, &state.config.trusted_proxy_cidrs)
+        .await
+        .map_err(|error| AuthError::too_many_requests(error.message()))?;
+    expire_old_login_challenges(&state).await?;
+    let poll_token = request.poll_token.trim();
+    if poll_token.is_empty() {
+        return Err(AuthError::bad_request("poll token is required"));
+    }
+
+    let poll_token_hash = token_hash(poll_token, &state.config.session_secret)?;
+    let Some(row) = sqlx::query(
+        "select
+            c.id,
+            c.status,
+            c.user_id,
+            c.error,
+            c.expires_at <= now() as expired,
+            c.consumed_at is not null as consumed
+         from microsoft_login_challenges c
+         where c.poll_token_hash = $1",
+    )
+    .bind(poll_token_hash)
+    .fetch_optional(&state.db)
+    .await?
+    else {
+        return Ok(Json(MicrosoftLoginPollResponse {
+            status: MicrosoftLoginStatus::Denied {
+                message: "login challenge was not found".to_string(),
+            },
+        }));
+    };
+
+    let challenge_id: Uuid = row.try_get("id")?;
+    let status: String = row.try_get("status")?;
+    let expired: bool = row.try_get("expired")?;
+    let consumed: bool = row.try_get("consumed")?;
+
+    if expired && status == "pending" {
+        sqlx::query("update microsoft_login_challenges set status = 'expired' where id = $1")
+            .bind(challenge_id)
+            .execute(&state.db)
+            .await?;
+        return Ok(Json(MicrosoftLoginPollResponse {
+            status: MicrosoftLoginStatus::Expired,
+        }));
+    }
+
+    match status.as_str() {
+        "pending" => Ok(Json(MicrosoftLoginPollResponse {
+            status: MicrosoftLoginStatus::Pending,
+        })),
+        "expired" => Ok(Json(MicrosoftLoginPollResponse {
+            status: MicrosoftLoginStatus::Expired,
+        })),
+        "denied" => Ok(Json(MicrosoftLoginPollResponse {
+            status: MicrosoftLoginStatus::Denied {
+                message: row
+                    .try_get::<Option<String>, _>("error")?
+                    .unwrap_or_else(|| "Microsoft login was denied".to_string()),
+            },
+        })),
+        "complete" => {
+            if consumed {
+                return Ok(Json(MicrosoftLoginPollResponse {
+                    status: MicrosoftLoginStatus::Denied {
+                        message: "login challenge was already used".to_string(),
+                    },
+                }));
+            }
+
+            let user_id = row
+                .try_get::<Option<Uuid>, _>("user_id")?
+                .ok_or_else(|| AuthError::internal("completed login is missing a user"))?;
+            let mut tx = state.db.begin().await?;
+            let Some(user) = active_user_for_session_tx(&mut tx, user_id).await? else {
+                let denied = sqlx::query(
+                    "update microsoft_login_challenges
+                     set status = 'denied', error = 'account is unavailable'
+                     where id = $1 and status = 'complete' and consumed_at is null",
+                )
+                .bind(challenge_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                let message = if denied.rows_affected() == 1 {
+                    "account is unavailable"
+                } else {
+                    "login challenge was already used"
+                };
+                return Ok(Json(MicrosoftLoginPollResponse {
+                    status: MicrosoftLoginStatus::Denied {
+                        message: message.to_string(),
+                    },
+                }));
+            };
+            let claimed = sqlx::query(
+                "update microsoft_login_challenges
+                 set consumed_at = now()
+                 where id = $1 and status = 'complete' and consumed_at is null
+                 returning id",
+            )
+            .bind(challenge_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if claimed.is_none() {
+                tx.rollback().await?;
+                return Ok(Json(MicrosoftLoginPollResponse {
+                    status: MicrosoftLoginStatus::Denied {
+                        message: "login challenge was already used".to_string(),
+                    },
+                }));
+            }
+
+            let session = create_session(&state, &mut tx, user, SessionSource::Microsoft).await?;
+            tx.commit().await?;
+
+            Ok(Json(MicrosoftLoginPollResponse {
+                status: MicrosoftLoginStatus::Complete { session },
+            }))
+        }
+        _ => Err(AuthError::internal("unknown login challenge status")),
+    }
+}
+
 async fn refresh(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -708,7 +912,7 @@ async fn refresh(
 
     let source: String = row.try_get("auth_source")?;
     let allowed = match source.as_str() {
-        "steam" => true,
+        "steam" | "microsoft" => true,
         "local_test" => {
             let provider_user_id: Option<String> = row.try_get("dev_provider_user_id")?;
             local_test_role(
@@ -861,6 +1065,244 @@ async fn complete_steam_login(
             Err(error)
         }
     }
+}
+
+async fn complete_microsoft_login(
+    state: &AppState,
+    callback: MicrosoftLoginCallback,
+) -> AuthResult<UserSummary> {
+    expire_old_login_challenges(state).await?;
+    let state_token = callback
+        .state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or_else(|| AuthError::bad_request("missing Microsoft login state"))?;
+    let state_hash = token_hash(state_token, &state.config.session_secret)?;
+    let Some(row) = sqlx::query(
+        "update microsoft_login_challenges
+         set callback_started_at = now()
+         where state_hash = $1
+           and status = 'pending'
+           and callback_started_at is null
+           and expires_at > now()
+         returning id, nonce_hash",
+    )
+    .bind(state_hash)
+    .fetch_optional(&state.db)
+    .await?
+    else {
+        return Err(AuthError::bad_request(
+            "Microsoft login challenge expired or is no longer pending",
+        ));
+    };
+    let challenge_id: Uuid = row.try_get("id")?;
+    let nonce_hash: String = row.try_get("nonce_hash")?;
+
+    let result = async {
+        if callback.error.is_some() {
+            return Err(AuthError::unauthorized("Microsoft sign-in was cancelled"));
+        }
+        let code = callback
+            .code
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 8_192)
+            .ok_or_else(|| AuthError::bad_request("Microsoft did not return a login code"))?;
+        let config = configured_microsoft_login(state)?;
+        let id_token = exchange_microsoft_login_code(state, &config, code).await?;
+        let claims = validate_microsoft_id_token(state, &config, &id_token).await?;
+        validate_microsoft_nonce(
+            claims.nonce.as_deref(),
+            &nonce_hash,
+            &state.config.session_secret,
+        )?;
+
+        let profile = microsoft_profile_from_claims(&claims);
+        let mut tx = state.db.begin().await?;
+        let user = find_or_create_microsoft_user(&mut tx, &claims.sub, &profile).await?;
+        let updated = sqlx::query(
+            "update microsoft_login_challenges
+             set status = 'complete', user_id = $2, completed_at = now(), error = null
+             where id = $1 and status = 'pending' and callback_started_at is not null",
+        )
+        .bind(challenge_id)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(AuthError::bad_request(
+                "Microsoft login challenge is no longer pending",
+            ));
+        }
+        tx.commit().await?;
+        Ok(user)
+    }
+    .await;
+
+    match result {
+        Ok(user) => Ok(user),
+        Err(error) => {
+            let _ = sqlx::query(
+                "update microsoft_login_challenges
+                 set status = 'denied', error = $2
+                 where id = $1 and status = 'pending' and callback_started_at is not null",
+            )
+            .bind(challenge_id)
+            .bind(&error.message)
+            .execute(&state.db)
+            .await;
+            Err(error)
+        }
+    }
+}
+
+fn configured_microsoft_login(state: &AppState) -> AuthResult<MicrosoftLoginConfig> {
+    state
+        .config
+        .microsoft_login
+        .clone()
+        .ok_or_else(|| AuthError::bad_request("Microsoft sign-in is not configured"))
+}
+
+fn microsoft_login_url(
+    config: &MicrosoftLoginConfig,
+    public_url: &str,
+    state_token: &str,
+    nonce: &str,
+) -> AuthResult<String> {
+    let redirect_uri = microsoft_callback_url(public_url);
+    let mut url = Url::parse(MICROSOFT_AUTHORIZE_ENDPOINT).map_err(|error| {
+        AuthError::internal(format!("invalid Microsoft authorization URL: {error}"))
+    })?;
+    url.query_pairs_mut()
+        .append_pair("client_id", &config.client_id)
+        .append_pair("response_type", "code")
+        .append_pair("response_mode", "form_post")
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("scope", "openid profile")
+        .append_pair("prompt", "select_account")
+        .append_pair("state", state_token)
+        .append_pair("nonce", nonce);
+    Ok(url.to_string())
+}
+
+fn microsoft_callback_url(public_url: &str) -> String {
+    format!(
+        "{}/auth/microsoft/callback",
+        public_url.trim_end_matches('/')
+    )
+}
+
+async fn exchange_microsoft_login_code(
+    state: &AppState,
+    config: &MicrosoftLoginConfig,
+    code: &str,
+) -> AuthResult<String> {
+    let redirect_uri = microsoft_callback_url(&state.config.public_url);
+    let response = state
+        .http
+        .post(MICROSOFT_TOKEN_ENDPOINT)
+        .form(&[
+            ("client_id", config.client_id.as_str()),
+            ("client_secret", config.client_secret.as_str()),
+            ("code", code),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("grant_type", "authorization_code"),
+        ])
+        .send()
+        .await
+        .map_err(|error| {
+            AuthError::bad_gateway(format!("Microsoft token exchange failed: {error}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(if response.status().is_server_error() {
+            AuthError::bad_gateway("Microsoft token exchange is temporarily unavailable")
+        } else {
+            AuthError::unauthorized("Microsoft login code was rejected")
+        });
+    }
+    let response = response
+        .json::<MicrosoftTokenResponse>()
+        .await
+        .map_err(|error| {
+            AuthError::bad_gateway(format!("Microsoft token response was invalid: {error}"))
+        })?;
+    let id_token = response.id_token.trim();
+    if id_token.is_empty() {
+        return Err(AuthError::bad_gateway(
+            "Microsoft token response did not include an ID token",
+        ));
+    }
+    Ok(id_token.to_string())
+}
+
+async fn validate_microsoft_id_token(
+    state: &AppState,
+    config: &MicrosoftLoginConfig,
+    id_token: &str,
+) -> AuthResult<MicrosoftIdTokenClaims> {
+    let header = decode_header(id_token)
+        .map_err(|_| AuthError::unauthorized("Microsoft ID token was invalid"))?;
+    if header.alg != Algorithm::RS256 {
+        return Err(AuthError::unauthorized(
+            "Microsoft ID token used an unexpected signing algorithm",
+        ));
+    }
+    let key_id = header
+        .kid
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AuthError::unauthorized("Microsoft ID token did not identify a signing key")
+        })?;
+    let response = state
+        .http
+        .get(MICROSOFT_JWKS_ENDPOINT)
+        .send()
+        .await
+        .map_err(|error| {
+            AuthError::bad_gateway(format!("Microsoft signing keys failed: {error}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(AuthError::bad_gateway(
+            "Microsoft signing keys are temporarily unavailable",
+        ));
+    }
+    let keys = response.json::<JwkSet>().await.map_err(|error| {
+        AuthError::bad_gateway(format!("Microsoft signing keys were invalid: {error}"))
+    })?;
+    let key = keys
+        .find(key_id)
+        .ok_or_else(|| AuthError::unauthorized("Microsoft ID token used an unknown signing key"))?;
+    let key = DecodingKey::from_jwk(key)
+        .map_err(|_| AuthError::unauthorized("Microsoft signing key was invalid"))?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&[config.client_id.as_str()]);
+    validation.set_issuer(&[MICROSOFT_ISSUER]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    validation.validate_nbf = true;
+    let token = decode::<MicrosoftIdTokenClaims>(id_token, &key, &validation)
+        .map_err(|_| AuthError::unauthorized("Microsoft ID token was invalid"))?;
+    Ok(token.claims)
+}
+
+fn validate_microsoft_nonce(
+    nonce: Option<&str>,
+    expected_hash: &str,
+    session_secret: &str,
+) -> AuthResult<()> {
+    let nonce = nonce
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or_else(|| AuthError::unauthorized("Microsoft ID token did not include a nonce"))?;
+    let nonce_hash = token_hash(nonce, session_secret)?;
+    if nonce_hash != expected_hash {
+        return Err(AuthError::unauthorized(
+            "Microsoft ID token nonce did not match the login challenge",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_challenge_id(query: &HashMap<String, String>) -> AuthResult<Uuid> {
@@ -1064,6 +1506,162 @@ async fn refresh_steam_user(
     update_steam_profile(tx, user.id, steam_id, profile).await
 }
 
+async fn find_or_create_microsoft_user(
+    tx: &mut Transaction<'_, Postgres>,
+    subject: &str,
+    profile: &MicrosoftProfile,
+) -> AuthResult<UserSummary> {
+    let subject = subject.trim();
+    if subject.is_empty() || subject.len() > 512 {
+        return Err(AuthError::unauthorized(
+            "Microsoft subject claim was invalid",
+        ));
+    }
+    if let Some((user, active)) = microsoft_identity_user_for_update(tx, subject).await? {
+        if !active {
+            return Err(AuthError::unauthorized("account is unavailable"));
+        }
+        return refresh_microsoft_user(tx, user, subject, profile).await;
+    }
+
+    let row = sqlx::query(
+        "insert into users (display_name)
+         values ($1)
+         returning id, display_name, avatar_url",
+    )
+    .bind(&profile.display_name)
+    .fetch_one(&mut **tx)
+    .await?;
+    let user = UserSummary {
+        id: row.try_get("id")?,
+        display_name: row.try_get("display_name")?,
+        avatar_url: row.try_get("avatar_url")?,
+    };
+
+    let inserted_identity = sqlx::query(
+        "insert into identities (
+            user_id,
+            provider,
+            provider_user_id,
+            provider_display_name
+         ) values ($1, 'microsoft', $2, $3)
+         on conflict (provider, provider_user_id) do nothing
+         returning user_id",
+    )
+    .bind(user.id)
+    .bind(subject)
+    .bind(&profile.display_name)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if inserted_identity.is_some() {
+        return Ok(user);
+    }
+
+    // A concurrent callback created the identity first. Remove the unreferenced contender.
+    sqlx::query("delete from users where id = $1")
+        .bind(user.id)
+        .execute(&mut **tx)
+        .await?;
+    let Some((user, active)) = microsoft_identity_user_for_update(tx, subject).await? else {
+        return Err(AuthError::internal(
+            "Microsoft identity conflict was not found",
+        ));
+    };
+    if !active {
+        return Err(AuthError::unauthorized("account is unavailable"));
+    }
+    refresh_microsoft_user(tx, user, subject, profile).await
+}
+
+async fn microsoft_identity_user_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    subject: &str,
+) -> Result<Option<(UserSummary, bool)>, sqlx::Error> {
+    let Some(row) = sqlx::query(
+        "select
+            u.id,
+            u.display_name,
+            u.avatar_url,
+            u.banned_at is null
+              and (u.suspended_until is null or u.suspended_until <= now()) as active
+         from identities i
+         join users u on u.id = i.user_id
+         where i.provider = 'microsoft' and i.provider_user_id = $1
+         for update of i, u",
+    )
+    .bind(subject)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        UserSummary {
+            id: row.try_get("id")?,
+            display_name: row.try_get("display_name")?,
+            avatar_url: row.try_get("avatar_url")?,
+        },
+        row.try_get("active")?,
+    )))
+}
+
+async fn refresh_microsoft_user(
+    tx: &mut Transaction<'_, Postgres>,
+    user: UserSummary,
+    subject: &str,
+    profile: &MicrosoftProfile,
+) -> AuthResult<UserSummary> {
+    sqlx::query(
+        "update identities
+         set provider_display_name = $3, updated_at = now()
+         where provider = 'microsoft' and provider_user_id = $2 and user_id = $1",
+    )
+    .bind(user.id)
+    .bind(subject)
+    .bind(&profile.display_name)
+    .execute(&mut **tx)
+    .await?;
+
+    let row = sqlx::query(
+        "update users
+         set display_name = $2, last_seen_at = now()
+         where id = $1
+         returning id, display_name, avatar_url",
+    )
+    .bind(user.id)
+    .bind(&profile.display_name)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(UserSummary {
+        id: row.try_get("id")?,
+        display_name: row.try_get("display_name")?,
+        avatar_url: row.try_get("avatar_url")?,
+    })
+}
+
+fn microsoft_profile_from_claims(claims: &MicrosoftIdTokenClaims) -> MicrosoftProfile {
+    let display_name = claims
+        .name
+        .as_deref()
+        .and_then(microsoft_display_name)
+        .unwrap_or_else(|| {
+            let subject = claims.sub.chars().take(12).collect::<String>();
+            format!("Microsoft {subject}")
+        });
+    MicrosoftProfile { display_name }
+}
+
+fn microsoft_display_name(value: &str) -> Option<String> {
+    let display_name = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(80)
+        .collect::<String>();
+    (!display_name.is_empty()).then_some(display_name)
+}
+
 async fn find_or_create_dev_user(
     tx: &mut Transaction<'_, Postgres>,
     account: &DevLoginAccount,
@@ -1075,11 +1673,11 @@ async fn find_or_create_dev_user(
              u.display_name,
              u.avatar_url,
              exists (
-                 select 1
-                 from identities steam_identity
-                 where steam_identity.user_id = u.id
-                   and steam_identity.provider = 'steam'
-             ) as has_steam_identity
+                  select 1
+                  from identities non_dev_identity
+                  where non_dev_identity.user_id = u.id
+                    and non_dev_identity.provider <> 'dev'
+              ) as has_non_dev_identity
          from identities i
           join users u on u.id = i.user_id
          where i.provider = 'dev' and i.provider_user_id = $1",
@@ -1089,7 +1687,7 @@ async fn find_or_create_dev_user(
     .await?
     {
         let id = row.try_get("id")?;
-        if row.try_get("has_steam_identity")? {
+        if row.try_get("has_non_dev_identity")? {
             return Ok(UserSummary {
                 id,
                 display_name: row.try_get("display_name")?,
@@ -1555,6 +2153,13 @@ async fn expire_old_login_challenges(state: &AppState) -> AuthResult<()> {
     )
     .execute(&state.db)
     .await?;
+    sqlx::query(
+        "update microsoft_login_challenges
+         set status = 'expired'
+         where status = 'pending' and expires_at <= now()",
+    )
+    .execute(&state.db)
+    .await?;
     opportunistic_auth_cleanup(state).await;
     Ok(())
 }
@@ -1581,6 +2186,13 @@ async fn opportunistic_auth_cleanup(state: &AppState) {
 async fn delete_expired_auth_records(db: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "delete from steam_login_challenges
+         where expires_at <= now() - make_interval(secs => $1)",
+    )
+    .bind(LOGIN_CHALLENGE_RETENTION_SECONDS as i32)
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "delete from microsoft_login_challenges
          where expires_at <= now() - make_interval(secs => $1)",
     )
     .bind(LOGIN_CHALLENGE_RETENTION_SECONDS as i32)
@@ -1656,6 +2268,27 @@ fn steam_login_error_page(message: &str) -> String {
     steam_login_page(
         "Steam login failed",
         "Steam login failed",
+        &html_escape(message),
+        true,
+    )
+}
+
+fn microsoft_login_success_page(display_name: &str) -> String {
+    steam_login_page(
+        "Microsoft login complete",
+        "Microsoft login complete",
+        &format!(
+            "Signed in as <strong>{}</strong>. You can return to AOM.",
+            html_escape(display_name)
+        ),
+        false,
+    )
+}
+
+fn microsoft_login_error_page(message: &str) -> String {
+    steam_login_page(
+        "Microsoft login failed",
+        "Microsoft login failed",
         &html_escape(message),
         true,
     )
@@ -1819,6 +2452,29 @@ struct SteamProfile {
 }
 
 #[derive(Deserialize)]
+struct MicrosoftLoginCallback {
+    state: Option<String>,
+    code: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MicrosoftTokenResponse {
+    id_token: String,
+}
+
+#[derive(Deserialize)]
+struct MicrosoftIdTokenClaims {
+    sub: String,
+    nonce: Option<String>,
+    name: Option<String>,
+}
+
+struct MicrosoftProfile {
+    display_name: String,
+}
+
+#[derive(Deserialize)]
 struct SteamPlayerSummariesResponse {
     response: SteamPlayersResponse,
 }
@@ -1925,6 +2581,7 @@ mod tests {
             run_migrations: false,
             session_secret: "test-session-secret-with-enough-length".to_string(),
             steam_web_api_key: None,
+            microsoft_login: None,
             enable_dev_login,
             dev_login_accounts,
             dev_login_proxy_token: None,
@@ -2046,6 +2703,100 @@ mod tests {
         assert!(page.contains("You can return to AOM."));
         assert!(!page.contains("Ready"));
         assert!(!page.contains("return to Agora"));
+    }
+
+    #[test]
+    fn microsoft_login_url_uses_the_personal_account_authority() {
+        let url = microsoft_login_url(
+            &MicrosoftLoginConfig {
+                client_id: "client-id".to_string(),
+                client_secret: "client-secret".to_string(),
+            },
+            "https://chat.example",
+            "state-token",
+            "nonce-token",
+        )
+        .unwrap();
+        let url = Url::parse(&url).unwrap();
+        let parameters = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("login.microsoftonline.com"));
+        assert_eq!(url.path(), "/consumers/oauth2/v2.0/authorize");
+        assert_eq!(parameters.get("client_id"), Some(&"client-id".to_string()));
+        assert_eq!(parameters.get("response_type"), Some(&"code".to_string()));
+        assert_eq!(
+            parameters.get("response_mode"),
+            Some(&"form_post".to_string())
+        );
+        assert_eq!(parameters.get("scope"), Some(&"openid profile".to_string()));
+        assert_eq!(parameters.get("state"), Some(&"state-token".to_string()));
+        assert_eq!(parameters.get("nonce"), Some(&"nonce-token".to_string()));
+        assert_eq!(
+            parameters.get("redirect_uri"),
+            Some(&"https://chat.example/auth/microsoft/callback".to_string())
+        );
+    }
+
+    #[test]
+    fn microsoft_nonce_must_match_its_login_challenge() {
+        let session_secret = "test-session-secret-with-enough-length";
+        let nonce_hash = token_hash("expected-nonce", session_secret).unwrap();
+
+        assert!(
+            validate_microsoft_nonce(Some("expected-nonce"), &nonce_hash, session_secret).is_ok()
+        );
+        assert!(
+            validate_microsoft_nonce(Some("other-nonce"), &nonce_hash, session_secret).is_err()
+        );
+        assert!(validate_microsoft_nonce(None, &nonce_hash, session_secret).is_err());
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn microsoft_login_start_creates_a_pending_challenge(pool: PgPool) {
+        let mut state = auth_test_state(pool);
+        Arc::get_mut(&mut state.config).unwrap().microsoft_login = Some(MicrosoftLoginConfig {
+            client_id: "test-microsoft-client".to_string(),
+            client_secret: "test-microsoft-secret".to_string(),
+        });
+        let peer_addr = "127.0.0.1:4000".parse().unwrap();
+
+        let Json(start) = microsoft_login_start(
+            State(state.clone()),
+            ConnectInfo(peer_addr),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let url = Url::parse(&start.browser_url).unwrap();
+        let parameters = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+        assert_eq!(
+            parameters.get("client_id"),
+            Some(&"test-microsoft-client".to_string())
+        );
+        assert_eq!(
+            parameters.get("redirect_uri"),
+            Some(&"http://localhost:8080/auth/microsoft/callback".to_string())
+        );
+        assert!(parameters
+            .get("state")
+            .is_some_and(|value| !value.is_empty()));
+        assert!(parameters
+            .get("nonce")
+            .is_some_and(|value| !value.is_empty()));
+
+        let Json(poll) = microsoft_login_poll(
+            State(state),
+            ConnectInfo(peer_addr),
+            HeaderMap::new(),
+            Json(MicrosoftLoginPollRequest {
+                poll_token: start.poll_token,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(poll.status, MicrosoftLoginStatus::Pending);
     }
 
     #[test]
@@ -2493,13 +3244,15 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
-        let sessions =
-            sqlx::query_scalar::<_, i64>("select count(*) from sessions where user_id = $1")
-                .bind(user.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(sessions, 0);
+        let active_sessions = sqlx::query_scalar::<_, i64>(
+            "select count(*) from sessions
+             where user_id = $1 and absolute_expires_at > now()",
+        )
+        .bind(user.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active_sessions, 0);
     }
 
     #[cfg(feature = "postgres-tests")]

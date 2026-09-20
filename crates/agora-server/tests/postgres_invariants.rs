@@ -378,7 +378,9 @@ async fn owner_role_and_audit_report_links_are_governed(pool: PgPool) -> sqlx::R
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn session_sources_distinguish_local_test_sessions(pool: PgPool) -> sqlx::Result<()> {
+async fn session_sources_include_microsoft_and_distinguish_local_test_sessions(
+    pool: PgPool,
+) -> sqlx::Result<()> {
     let user = insert_user(&pool, "fixture").await?;
     let family = Uuid::new_v4();
     sqlx::query(
@@ -408,6 +410,45 @@ async fn session_sources_distinguish_local_test_sessions(pool: PgPool) -> sqlx::
     )
     .bind(user)
     .fetch_one(&pool)
+    .await?;
+    sqlx::query(
+        "insert into sessions (
+            user_id,
+            refresh_token_hash,
+            expires_at,
+            absolute_expires_at,
+            session_family_id,
+            auth_source,
+            revoked_at
+         ) values (
+            $1,
+            'microsoft-refresh',
+            now() + interval '1 day',
+            now() + interval '1 day',
+            $2,
+            'microsoft',
+            null
+         ), (
+            $1,
+            'legacy-refresh',
+            now() + interval '1 day',
+            now() + interval '1 day',
+            $3,
+            'legacy',
+            now()
+         )",
+    )
+    .bind(user)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await?;
+    let additional_sources = sqlx::query_scalar::<_, String>(
+        "select auth_source from sessions
+         where refresh_token_hash in ('microsoft-refresh', 'legacy-refresh')
+         order by auth_source",
+    )
+    .fetch_all(&pool)
     .await?;
     let invalid_result = sqlx::query(
         "insert into sessions (
@@ -453,6 +494,7 @@ async fn session_sources_distinguish_local_test_sessions(pool: PgPool) -> sqlx::
     .await;
 
     assert_eq!(source, "local_test");
+    assert_eq!(additional_sources, vec!["legacy", "microsoft"]);
     assert!(invalid_result.is_err());
     assert!(unsafe_legacy_result.is_err());
     Ok(())

@@ -11,6 +11,22 @@ This runbook deploys the Compose stack in `docker-compose.prod.yml`: Caddy is th
 
 Set `AGORA_SITE_ADDRESS` to a public DNS hostname and `AGORA_PUBLIC_URL` to its matching `https://` URL. Caddy obtains and renews certificates automatically; port 80 must remain reachable for normal ACME validation and redirects.
 
+## Microsoft personal accounts
+
+Microsoft sign-in is optional and accepts personal Microsoft accounts only. It uses Microsoft's `consumers` authority, creates a separate Agora identity from any Steam identity, and does not verify Xbox, Microsoft Store, or Game Pass ownership.
+
+1. In Microsoft Entra admin center, register an application for **Personal Microsoft accounts only**.
+2. Add a **Web** platform redirect URI matching `AGORA_PUBLIC_URL` exactly with `/auth/microsoft/callback` appended, such as `https://chat.example.com/auth/microsoft/callback`.
+3. Create a client secret and retain its **Value**. The secret value is shown only once.
+4. Set both values in the protected production `.env` file:
+
+```dotenv
+AGORA_MICROSOFT_CLIENT_ID=<Application-client-ID>
+AGORA_MICROSOFT_CLIENT_SECRET=<client-secret-value>
+```
+
+Set neither variable to leave Microsoft sign-in disabled; setting only one makes the server fail closed at startup. Do not grant Microsoft Graph, Xbox, or other API permissions. Agora requests only `openid profile`, validates the returned ID token, and stores the OIDC subject and display name without requesting email access.
+
 ## Image pinning
 
 The Compose defaults use reviewed tag-and-digest references for Caddy and PostgreSQL. The server is already required as a repository plus immutable digest. Keep all three immutable in production:
@@ -56,7 +72,7 @@ docker compose --env-file .env -f docker-compose.prod.yml ps
 curl.exe --fail --retry 12 https://chat.example.com/health
 ```
 
-The server runs as UID/GID `10001`, has a read-only root filesystem and only a small writable `/tmp`, and drops Linux capabilities. Caddy-to-server and server-to-PostgreSQL traffic use separate internal networks, so Caddy cannot reach PostgreSQL directly. The server also has a separate egress network because Steam OpenID and the Steam Web API require outbound access. Caddy retains only the bind capability needed for ports 80/443, and its writable certificate/config paths are named volumes.
+The server runs as UID/GID `10001`, has a read-only root filesystem and only a small writable `/tmp`, and drops Linux capabilities. Caddy-to-server and server-to-PostgreSQL traffic use separate internal networks, so Caddy cannot reach PostgreSQL directly. The server also has a separate egress network because Steam OpenID, the Steam Web API, and Microsoft OpenID Connect require outbound access. Caddy retains only the bind capability needed for ports 80/443, and its writable certificate/config paths are named volumes.
 
 ## Proxy network
 

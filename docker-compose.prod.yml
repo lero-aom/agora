@@ -57,6 +57,8 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       DATABASE_URL: "postgres://agora@postgres:5432/agora"
       STEAM_WEB_API_KEY: ${STEAM_WEB_API_KEY:-}
+      AGORA_MICROSOFT_CLIENT_ID: ${AGORA_MICROSOFT_CLIENT_ID:-}
+      AGORA_MICROSOFT_CLIENT_SECRET: ${AGORA_MICROSOFT_CLIENT_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy

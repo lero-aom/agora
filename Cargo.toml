@@ -38,6 +38,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 webbrowser = "0.8"
 global-hotkey = "0.5"
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+jsonwebtoken = { version = "10.2", default-features = false, features = ["rust_crypto"] }
 winresource = "0.1"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

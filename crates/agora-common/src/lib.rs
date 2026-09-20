@@ -72,6 +72,32 @@ pub enum SteamLoginStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MicrosoftLoginStartResponse {
+    pub browser_url: String,
+    pub poll_token: String,
+    pub expires_in_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MicrosoftLoginPollRequest {
+    pub poll_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MicrosoftLoginPollResponse {
+    pub status: MicrosoftLoginStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MicrosoftLoginStatus {
+    Pending,
+    Complete { session: AuthSession },
+    Expired,
+    Denied { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthSession {
     pub access_token: String,
     pub refresh_token: String,

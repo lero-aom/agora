@@ -67,6 +67,7 @@ pub(crate) struct Config {
     pub(crate) run_migrations: bool,
     pub(crate) session_secret: String,
     pub(crate) steam_web_api_key: Option<String>,
+    pub(crate) microsoft_login: Option<MicrosoftLoginConfig>,
     pub(crate) enable_dev_login: bool,
     pub(crate) dev_login_accounts: Vec<DevLoginAccount>,
     pub(crate) dev_login_proxy_token: Option<String>,
@@ -79,6 +80,12 @@ pub(crate) struct DevLoginAccount {
     pub(crate) account_id: String,
     pub(crate) display_name: String,
     pub(crate) role: UserRole,
+}
+
+#[derive(Clone)]
+pub(crate) struct MicrosoftLoginConfig {
+    pub(crate) client_id: String,
+    pub(crate) client_secret: String,
 }
 
 struct RealtimeSingletonLock {
@@ -122,6 +129,7 @@ impl Config {
         validate_realtime_mode(&env_or("AGORA_REALTIME_MODE", "single-replica"))?;
         let session_secret = env_or("AGORA_SESSION_SECRET", "dev-insecure-change-me");
         validate_session_secret(&session_secret, public_url_is_loopback)?;
+        let microsoft_login = microsoft_login_config_from_env()?;
         let minimum_client_version = env_or("AGORA_MIN_CLIENT_VERSION", env!("CARGO_PKG_VERSION"))
             .trim()
             .to_string();
@@ -158,6 +166,7 @@ impl Config {
             run_migrations: env_bool("AGORA_RUN_MIGRATIONS", true)?,
             session_secret,
             steam_web_api_key: env_optional("STEAM_WEB_API_KEY"),
+            microsoft_login,
             dev_login_proxy_token: env_optional("AGORA_DEV_LOGIN_PROXY_TOKEN"),
             trusted_proxy_cidrs,
             websocket_max_connections,
@@ -426,6 +435,37 @@ fn env_optional(name: &str) -> Option<String> {
     })
 }
 
+fn microsoft_login_config_from_env() -> Result<Option<MicrosoftLoginConfig>> {
+    microsoft_login_config_from_values(
+        env_optional("AGORA_MICROSOFT_CLIENT_ID"),
+        env_optional("AGORA_MICROSOFT_CLIENT_SECRET"),
+    )
+}
+
+fn microsoft_login_config_from_values(
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Result<Option<MicrosoftLoginConfig>> {
+    match (client_id, client_secret) {
+        (None, None) => Ok(None),
+        (Some(client_id), Some(client_secret)) => {
+            if client_id.len() > 256 {
+                bail!("AGORA_MICROSOFT_CLIENT_ID must be at most 256 characters")
+            }
+            if client_secret.len() > 4_096 {
+                bail!("AGORA_MICROSOFT_CLIENT_SECRET must be at most 4096 characters")
+            }
+            Ok(Some(MicrosoftLoginConfig {
+                client_id,
+                client_secret,
+            }))
+        }
+        _ => bail!(
+            "AGORA_MICROSOFT_CLIENT_ID and AGORA_MICROSOFT_CLIENT_SECRET must be set together"
+        ),
+    }
+}
+
 fn parse_bounded_usize(value: &str, name: &str, max: usize) -> Result<usize> {
     let parsed = value
         .trim()
@@ -616,6 +656,26 @@ mod tests {
         assert!(parse_bounded_usize("0", "LIMIT", 10).is_err());
         assert!(parse_bounded_usize("11", "LIMIT", 10).is_err());
         assert!(parse_bounded_usize("nope", "LIMIT", 10).is_err());
+    }
+
+    #[test]
+    fn microsoft_login_credentials_must_be_paired() {
+        assert!(microsoft_login_config_from_values(None, None)
+            .unwrap()
+            .is_none());
+        assert!(microsoft_login_config_from_values(Some("client-id".to_string()), None).is_err());
+        assert!(
+            microsoft_login_config_from_values(None, Some("client-secret".to_string())).is_err()
+        );
+
+        let config = microsoft_login_config_from_values(
+            Some("client-id".to_string()),
+            Some("client-secret".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.client_id, "client-id");
+        assert_eq!(config.client_secret, "client-secret");
     }
 
     #[test]

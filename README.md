@@ -2,7 +2,7 @@
 
 ## Local Fixture Mode
 
-Local Docker development enables fake identities instead of Steam login. The server only permits this mode when `AGORA_PUBLIC_URL` is loopback, and the development Compose ports bind to `127.0.0.1`.
+Local Docker development enables fake identities instead of remote Steam or Microsoft login. The server only permits this mode when `AGORA_PUBLIC_URL` is loopback, and the development Compose ports bind to `127.0.0.1`.
 
 Start the local stack with:
 
@@ -32,6 +32,12 @@ Example workflow:
 3. Sign in as a staff fixture to review the report and exercise the permitted moderation actions.
 
 Do not enable local fixture mode or copy its fixture configuration to a public deployment.
+
+## Remote Sign-In
+
+Public servers offer Steam and, when configured, Microsoft personal-account sign-in from the client toolbar. Microsoft identities are separate Agora accounts from Steam identities, even when the same person controls both. Agora does not link those accounts or verify Xbox, Microsoft Store, or Game Pass ownership.
+
+Microsoft app registration, redirect URI, and credential configuration are documented in [docs/deployment.md](docs/deployment.md).
 
 ## Deployment and Operations
 

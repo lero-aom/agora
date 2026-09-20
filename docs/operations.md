@@ -58,4 +58,4 @@ The restore command has high confirmation impact. `-Force` is intentionally requ
 
 ## Incident notes
 
-Record the deployed server digest, Compose revision, backup checksum, timestamps, and observed health/log output for every deployment or restore incident. Preserve logs and evidence while avoiding collection of access tokens, passwords, Steam credentials, or unredacted user content.
+Record the deployed server digest, Compose revision, backup checksum, timestamps, and observed health/log output for every deployment or restore incident. Preserve logs and evidence while avoiding collection of access tokens, passwords, Steam or Microsoft credentials, or unredacted user content.

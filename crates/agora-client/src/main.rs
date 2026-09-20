@@ -91,10 +91,12 @@ use agora_common::{
     CreateReportResponse, DevLoginRequest, DevLoginResponse, DmMessage, DmMessageHistoryResponse,
     DmRealtimeEvent, DmThreadListResponse, DmThreadSummary, FriendListResponse, FriendRequest,
     FriendshipResponse, FriendshipStatus, FriendshipSummary, LogoutRequest, LogoutResponse,
-    MessageKind, PresenceCounts, PresenceState, RefreshRequest, RefreshResponse,
-    RemoveFriendResponse, SendDmMessageRequest, SendDmMessageResponse, ServerEvent,
-    SteamLoginPollRequest, SteamLoginPollResponse, SteamLoginStartResponse, SteamLoginStatus,
-    UnblockUserResponse, UserSearchResponse, UserSummary, MAX_MESSAGE_LEN, PROTOCOL_VERSION,
+    MessageKind, MicrosoftLoginPollRequest, MicrosoftLoginPollResponse,
+    MicrosoftLoginStartResponse, MicrosoftLoginStatus, PresenceCounts, PresenceState,
+    RefreshRequest, RefreshResponse, RemoveFriendResponse, SendDmMessageRequest,
+    SendDmMessageResponse, ServerEvent, SteamLoginPollRequest, SteamLoginPollResponse,
+    SteamLoginStartResponse, SteamLoginStatus, UnblockUserResponse, UserSearchResponse,
+    UserSummary, MAX_MESSAGE_LEN, PROTOCOL_VERSION,
 };
 #[cfg(windows)]
 use dioxus::desktop::tao::platform::windows::WindowExtWindows;
@@ -173,6 +175,10 @@ const TASKBAR_ANCHOR_POSITION: i32 = -32_000;
 const TASKBAR_ANCHOR_SIZE: i32 = 1;
 #[cfg(windows)]
 const DELETED_MESSAGE_CACHE_LIMIT: usize = 500;
+#[cfg(windows)]
+const USER_AUTOCOMPLETE_MIN_QUERY_CHARS: usize = 2;
+#[cfg(windows)]
+const USER_AUTOCOMPLETE_DEBOUNCE_MS: u64 = 300;
 
 #[cfg(windows)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -181,6 +187,38 @@ enum AppTab {
     DirectMessages,
     Friends,
     BlockReport,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteLoginProvider {
+    Steam,
+    Microsoft,
+}
+
+#[cfg(windows)]
+impl RemoteLoginProvider {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Steam => "Steam",
+            Self::Microsoft => "Microsoft",
+        }
+    }
+
+    fn selection_value(self) -> &'static str {
+        match self {
+            Self::Steam => "steam",
+            Self::Microsoft => "microsoft",
+        }
+    }
+
+    fn from_selection_value(value: &str) -> Option<Self> {
+        match value {
+            "steam" => Some(Self::Steam),
+            "microsoft" => Some(Self::Microsoft),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -249,6 +287,19 @@ struct RelationshipSignals {
 
 #[cfg(windows)]
 #[derive(Clone, Copy)]
+struct UserAutocompleteSignals {
+    query: Signal<String>,
+    results: Signal<Vec<UserSummary>>,
+    selected: Signal<Option<UserSummary>>,
+    request_generation: Signal<u64>,
+    pending: Signal<bool>,
+    expanded: Signal<bool>,
+    active_index: Signal<Option<usize>>,
+    status: Signal<String>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
 struct DirectMessageSignals {
     threads: Signal<Vec<DmThreadSummary>>,
     threads_load_generation: Signal<u64>,
@@ -258,14 +309,11 @@ struct DirectMessageSignals {
     history_load_generation: Signal<u64>,
     status: Signal<String>,
     composer_body: Signal<String>,
-    search_query: Signal<String>,
-    search_results: Signal<Vec<UserSummary>>,
-    search_load_generation: Signal<u64>,
+    search: UserAutocompleteSignals,
     threads_pending: Signal<bool>,
     history_pending: Signal<bool>,
     create_pending: Signal<bool>,
     send_pending: Signal<bool>,
-    search_pending: Signal<bool>,
 }
 
 #[cfg(windows)]
@@ -452,6 +500,7 @@ fn App() -> Element {
     let mut reauth_required = use_signal(|| None::<String>);
     let session_generation = use_signal(|| 0u64);
     let local_dev_account_id = use_signal(configured_local_dev_account_id);
+    let remote_login_provider = use_signal(|| RemoteLoginProvider::Steam);
     let chat_messages = use_signal(Vec::<ChatMessage>::new);
     let deleted_message_ids = use_signal(Vec::<uuid::Uuid>::new);
     let chat_status = use_signal(|| "Sign in to connect to global chat".to_string());
@@ -483,24 +532,46 @@ fn App() -> Element {
         history_load_generation: use_signal(|| 0u64),
         status: use_signal(|| "Sign in to load direct messages".to_string()),
         composer_body: use_signal(String::new),
-        search_query: use_signal(String::new),
-        search_results: use_signal(Vec::<UserSummary>::new),
-        search_load_generation: use_signal(|| 0u64),
+        search: UserAutocompleteSignals {
+            query: use_signal(String::new),
+            results: use_signal(Vec::<UserSummary>::new),
+            selected: use_signal(|| None::<UserSummary>),
+            request_generation: use_signal(|| 0u64),
+            pending: use_signal(|| false),
+            expanded: use_signal(|| false),
+            active_index: use_signal(|| None::<usize>),
+            status: use_signal(String::new),
+        },
         threads_pending: use_signal(|| false),
         history_pending: use_signal(|| false),
         create_pending: use_signal(|| false),
         send_pending: use_signal(|| false),
-        search_pending: use_signal(|| false),
     };
     let friendships = use_signal(Vec::<FriendshipSummary>::new);
     let friendships_load_generation = use_signal(|| 0u64);
-    let friend_search_query = use_signal(String::new);
-    let friend_search_results = use_signal(Vec::<UserSummary>::new);
+    let friend_search = UserAutocompleteSignals {
+        query: use_signal(String::new),
+        results: use_signal(Vec::<UserSummary>::new),
+        selected: use_signal(|| None::<UserSummary>),
+        request_generation: use_signal(|| 0u64),
+        pending: use_signal(|| false),
+        expanded: use_signal(|| false),
+        active_index: use_signal(|| None::<usize>),
+        status: use_signal(String::new),
+    };
     let friends_status = use_signal(|| "Sign in to load friends".to_string());
     let blocked_users = use_signal(Vec::<UserSummary>::new);
     let blocks_load_generation = use_signal(|| 0u64);
-    let block_search_query = use_signal(String::new);
-    let block_search_results = use_signal(Vec::<UserSummary>::new);
+    let block_search = UserAutocompleteSignals {
+        query: use_signal(String::new),
+        results: use_signal(Vec::<UserSummary>::new),
+        selected: use_signal(|| None::<UserSummary>),
+        request_generation: use_signal(|| 0u64),
+        pending: use_signal(|| false),
+        expanded: use_signal(|| false),
+        active_index: use_signal(|| None::<usize>),
+        status: use_signal(String::new),
+    };
     let block_status = use_signal(|| "Sign in to manage blocks".to_string());
     let report_reason = use_signal(String::new);
     let report_details = use_signal(String::new);
@@ -599,9 +670,11 @@ fn App() -> Element {
                                     updates,
                                     friendships,
                                     friendships_load_generation,
+                                    friend_search,
                                     friends_status,
                                     blocked_users,
                                     blocks_load_generation,
+                                    block_search,
                                     block_status,
                                     report_draft,
                                     direct_messages,
@@ -630,12 +703,10 @@ fn App() -> Element {
                                 );
                                 reset_relationship_state(
                                     friendships,
-                                    friend_search_query,
-                                    friend_search_results,
+                                    friend_search,
                                     friends_status,
                                     blocked_users,
-                                    block_search_query,
-                                    block_search_results,
+                                    block_search,
                                     block_status,
                                     report_reason,
                                     report_details,
@@ -775,6 +846,7 @@ fn App() -> Element {
                 session_generation,
                 reauth_required,
                 local_dev_account_id,
+                remote_login_provider,
                 auth_action_pending,
                 auth_session,
                 login_status,
@@ -793,13 +865,11 @@ fn App() -> Element {
                 overlay_interactive,
                 friendships,
                 friendships_load_generation,
-                friend_search_query,
-                friend_search_results,
+                friend_search,
                 friends_status,
                 blocked_users,
                 blocks_load_generation,
-                block_search_query,
-                block_search_results,
+                block_search,
                 block_status,
                 report_reason,
                 report_details,
@@ -1645,9 +1715,11 @@ fn start_session_refresh_loop(
     updates: UpdateSignals,
     mut friendships: Signal<Vec<FriendshipSummary>>,
     friendships_load_generation: Signal<u64>,
+    friend_search: UserAutocompleteSignals,
     mut friends_status: Signal<String>,
     mut blocked_users: Signal<Vec<UserSummary>>,
     blocks_load_generation: Signal<u64>,
+    block_search: UserAutocompleteSignals,
     mut block_status: Signal<String>,
     mut report_draft: Signal<Option<ReportDraft>>,
     direct_messages: DirectMessageSignals,
@@ -1682,6 +1754,8 @@ fn start_session_refresh_loop(
 
                     generation = next_session_generation(session_generation);
                     clear_direct_message_pending(direct_messages);
+                    invalidate_user_autocomplete(friend_search);
+                    invalidate_user_autocomplete(block_search);
                     retry_attempt = 0;
                     let display_name = refreshed.user.display_name.clone();
                     match store_refresh_token(&refreshed.refresh_token) {
@@ -1745,8 +1819,10 @@ fn start_session_refresh_loop(
                         chat_send_pending,
                     );
                     friendships.set(Vec::new());
+                    reset_user_autocomplete(friend_search);
                     friends_status.set("Sign in to load friends".to_string());
                     blocked_users.set(Vec::new());
+                    reset_user_autocomplete(block_search);
                     block_status.set("Sign in to manage blocks".to_string());
                     report_draft.set(None);
                     reset_direct_message_state(direct_messages);
@@ -1879,6 +1955,7 @@ fn sign_in_session(
     session_generation: Signal<u64>,
     mut reauth_required: Signal<Option<String>>,
     local_dev_account_id: String,
+    remote_login_provider: RemoteLoginProvider,
     mut login_status: Signal<String>,
     chat_messages: Signal<Vec<ChatMessage>>,
     deleted_message_ids: Signal<Vec<uuid::Uuid>>,
@@ -1890,9 +1967,11 @@ fn sign_in_session(
     updates: UpdateSignals,
     friendships: Signal<Vec<FriendshipSummary>>,
     friendships_load_generation: Signal<u64>,
+    friend_search: UserAutocompleteSignals,
     friends_status: Signal<String>,
     blocked_users: Signal<Vec<UserSummary>>,
     blocks_load_generation: Signal<u64>,
+    block_search: UserAutocompleteSignals,
     block_status: Signal<String>,
     report_draft: Signal<Option<ReportDraft>>,
     direct_messages: DirectMessageSignals,
@@ -1903,12 +1982,14 @@ fn sign_in_session(
     auth_action_pending.set(true);
     next_session_generation(session_generation);
     clear_direct_message_pending(direct_messages);
+    reset_user_autocomplete(friend_search);
+    reset_user_autocomplete(block_search);
 
     spawn(async move {
-        let start_message = login_start_message(&local_dev_account_id);
+        let start_message = login_start_message(&local_dev_account_id, remote_login_provider);
         login_status.set(start_message.clone());
         chat_status.set(start_message);
-        match complete_login(&local_dev_account_id).await {
+        match complete_login(&local_dev_account_id, remote_login_provider).await {
             Ok(session) => {
                 next_session_generation(session_generation);
                 let display_name = session.user.display_name.clone();
@@ -1964,9 +2045,11 @@ fn sign_in_session(
                     updates,
                     friendships,
                     friendships_load_generation,
+                    friend_search,
                     friends_status,
                     blocked_users,
                     blocks_load_generation,
+                    block_search,
                     block_status,
                     report_draft,
                     direct_messages,
@@ -1998,12 +2081,10 @@ fn sign_out_session(
     chat_outbox: Signal<Option<UnboundedSender<OutgoingChatEvent>>>,
     chat_send_pending: Signal<bool>,
     friendships: Signal<Vec<FriendshipSummary>>,
-    friend_search_query: Signal<String>,
-    friend_search_results: Signal<Vec<UserSummary>>,
+    friend_search: UserAutocompleteSignals,
     friends_status: Signal<String>,
     blocked_users: Signal<Vec<UserSummary>>,
-    block_search_query: Signal<String>,
-    block_search_results: Signal<Vec<UserSummary>>,
+    block_search: UserAutocompleteSignals,
     block_status: Signal<String>,
     report_reason: Signal<String>,
     report_details: Signal<String>,
@@ -2034,12 +2115,10 @@ fn sign_out_session(
         );
         reset_relationship_state(
             friendships,
-            friend_search_query,
-            friend_search_results,
+            friend_search,
             friends_status,
             blocked_users,
-            block_search_query,
-            block_search_results,
+            block_search,
             block_status,
             report_reason,
             report_details,
@@ -2077,12 +2156,10 @@ fn sign_out_session(
 #[allow(clippy::too_many_arguments)]
 fn reset_relationship_state(
     mut friendships: Signal<Vec<FriendshipSummary>>,
-    mut friend_search_query: Signal<String>,
-    mut friend_search_results: Signal<Vec<UserSummary>>,
+    friend_search: UserAutocompleteSignals,
     mut friends_status: Signal<String>,
     mut blocked_users: Signal<Vec<UserSummary>>,
-    mut block_search_query: Signal<String>,
-    mut block_search_results: Signal<Vec<UserSummary>>,
+    block_search: UserAutocompleteSignals,
     mut block_status: Signal<String>,
     mut report_reason: Signal<String>,
     mut report_details: Signal<String>,
@@ -2090,12 +2167,10 @@ fn reset_relationship_state(
     mut report_status: Signal<String>,
 ) {
     friendships.set(Vec::new());
-    friend_search_query.set(String::new());
-    friend_search_results.set(Vec::new());
+    reset_user_autocomplete(friend_search);
     friends_status.set("Sign in to load friends".to_string());
     blocked_users.set(Vec::new());
-    block_search_query.set(String::new());
-    block_search_results.set(Vec::new());
+    reset_user_autocomplete(block_search);
     block_status.set("Sign in to manage blocks".to_string());
     report_reason.set(String::new());
     report_details.set(String::new());
@@ -2113,8 +2188,7 @@ fn reset_direct_message_state(mut signals: DirectMessageSignals) {
         .status
         .set("Sign in to load direct messages".to_string());
     signals.composer_body.set(String::new());
-    signals.search_query.set(String::new());
-    signals.search_results.set(Vec::new());
+    reset_user_autocomplete(signals.search);
     clear_direct_message_pending(signals);
 }
 
@@ -2124,12 +2198,11 @@ fn clear_direct_message_pending(mut signals: DirectMessageSignals) {
     // requests so an old task that exits on its generation check cannot strand the UI.
     next_direct_message_load_generation(signals.threads_load_generation);
     next_direct_message_load_generation(signals.history_load_generation);
-    next_direct_message_load_generation(signals.search_load_generation);
+    invalidate_user_autocomplete(signals.search);
     signals.threads_pending.set(false);
     signals.history_pending.set(false);
     signals.create_pending.set(false);
     signals.send_pending.set(false);
-    signals.search_pending.set(false);
 }
 
 #[cfg(windows)]
@@ -2293,53 +2366,196 @@ fn load_direct_message_history_page(
 }
 
 #[cfg(windows)]
-fn search_direct_message_users(
-    session: AuthSession,
+fn user_autocomplete_query_ready(query: &str) -> bool {
+    query.trim().chars().count() >= USER_AUTOCOMPLETE_MIN_QUERY_CHARS
+}
+
+#[cfg(windows)]
+fn next_user_autocomplete_generation(mut signals: UserAutocompleteSignals) -> u64 {
+    let current = *signals.request_generation.read();
+    let next = current.wrapping_add(1);
+    signals.request_generation.set(next);
+    next
+}
+
+#[cfg(windows)]
+fn user_autocomplete_request_current(
     session_generation: Signal<u64>,
-    mut signals: DirectMessageSignals,
+    session_value: u64,
+    signals: UserAutocompleteSignals,
+    request_generation: u64,
+    query: &str,
+) -> bool {
+    session_generation_current(session_generation, session_value)
+        && *signals.request_generation.read() == request_generation
+        && signals.query.read().trim() == query
+}
+
+#[cfg(windows)]
+fn update_user_autocomplete_query(
+    session: Option<AuthSession>,
+    session_generation: Signal<u64>,
+    mut signals: UserAutocompleteSignals,
+    value: String,
 ) {
-    let query = signals.search_query.read().trim().to_string();
-    if query.is_empty() {
-        signals.search_results.set(Vec::new());
-        signals.search_pending.set(false);
-        signals
-            .status
-            .set("Enter a name to start a direct message".to_string());
+    let query = value.trim().to_string();
+    signals.query.set(value);
+    signals.selected.set(None);
+    signals.results.set(Vec::new());
+    signals.active_index.set(None);
+    let request_generation = next_user_autocomplete_generation(signals);
+
+    if !user_autocomplete_query_ready(&query) {
+        signals.pending.set(false);
+        signals.expanded.set(false);
+        signals.status.set(if query.is_empty() {
+            String::new()
+        } else {
+            format!("Type at least {USER_AUTOCOMPLETE_MIN_QUERY_CHARS} characters to search")
+        });
         return;
     }
 
-    let generation = *session_generation.read();
-    let load_generation = next_direct_message_load_generation(signals.search_load_generation);
-    signals.search_pending.set(true);
+    let Some(session) = session else {
+        signals.pending.set(false);
+        signals.expanded.set(false);
+        signals
+            .status
+            .set("Sign in to search for users".to_string());
+        return;
+    };
+
+    let session_value = *session_generation.read();
+    signals.pending.set(true);
+    signals.expanded.set(true);
     signals.status.set(format!("Searching for {query}..."));
     spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            USER_AUTOCOMPLETE_DEBOUNCE_MS,
+        ))
+        .await;
+        if !user_autocomplete_request_current(
+            session_generation,
+            session_value,
+            signals,
+            request_generation,
+            &query,
+        ) {
+            return;
+        }
+
         match search_users_api(&session, &query).await {
             Ok(users) => {
-                if session_generation_current(session_generation, generation)
-                    && direct_message_load_generation_current(
-                        signals.search_load_generation,
-                        load_generation,
-                    )
-                {
-                    let count = users.len();
-                    signals.search_results.set(users);
-                    signals.search_pending.set(false);
-                    signals.status.set(format!("Found {count} users"));
+                if !user_autocomplete_request_current(
+                    session_generation,
+                    session_value,
+                    signals,
+                    request_generation,
+                    &query,
+                ) {
+                    return;
                 }
+
+                let count = users.len();
+                signals.results.set(users);
+                signals.pending.set(false);
+                signals.active_index.set((count > 0).then_some(0));
+                signals.status.set(if count == 0 {
+                    "No matching users".to_string()
+                } else {
+                    format!("Found {count} users")
+                });
             }
             Err(error) => {
-                if session_generation_current(session_generation, generation)
-                    && direct_message_load_generation_current(
-                        signals.search_load_generation,
-                        load_generation,
-                    )
-                {
-                    signals.search_pending.set(false);
+                if user_autocomplete_request_current(
+                    session_generation,
+                    session_value,
+                    signals,
+                    request_generation,
+                    &query,
+                ) {
+                    signals.results.set(Vec::new());
+                    signals.pending.set(false);
+                    signals.active_index.set(None);
                     signals.status.set(error);
                 }
             }
         }
     });
+}
+
+#[cfg(windows)]
+fn select_user_autocomplete_option(mut signals: UserAutocompleteSignals, index: usize) {
+    let Some(user) = signals.results.read().get(index).cloned() else {
+        return;
+    };
+
+    next_user_autocomplete_generation(signals);
+    let display_name = user.display_name.clone();
+    signals.query.set(display_name.clone());
+    signals.results.set(Vec::new());
+    signals.selected.set(Some(user));
+    signals.pending.set(false);
+    signals.expanded.set(false);
+    signals.active_index.set(None);
+    signals.status.set(format!("Selected {display_name}"));
+}
+
+#[cfg(windows)]
+fn next_user_autocomplete_active_index(
+    count: usize,
+    active: Option<usize>,
+    move_forward: bool,
+) -> Option<usize> {
+    match (count, active, move_forward) {
+        (0, _, _) => None,
+        (count, Some(index), true) if index < count => Some((index + 1) % count),
+        (count, Some(index), false) if index < count => Some((index + count - 1) % count),
+        (_, _, true) => Some(0),
+        (count, _, false) => Some(count - 1),
+    }
+}
+
+#[cfg(windows)]
+fn move_user_autocomplete_active_option(mut signals: UserAutocompleteSignals, move_forward: bool) {
+    let next = next_user_autocomplete_active_index(
+        signals.results.read().len(),
+        *signals.active_index.read(),
+        move_forward,
+    );
+    signals.active_index.set(next);
+    if next.is_some() {
+        signals.expanded.set(true);
+    }
+}
+
+#[cfg(windows)]
+fn dismiss_user_autocomplete(mut signals: UserAutocompleteSignals) {
+    signals.expanded.set(false);
+    signals.active_index.set(None);
+}
+
+#[cfg(windows)]
+fn show_user_autocomplete(mut signals: UserAutocompleteSignals) {
+    if signals.selected.read().is_none() && user_autocomplete_query_ready(&signals.query.read()) {
+        signals.expanded.set(true);
+    }
+}
+
+#[cfg(windows)]
+fn invalidate_user_autocomplete(mut signals: UserAutocompleteSignals) {
+    next_user_autocomplete_generation(signals);
+    signals.pending.set(false);
+    dismiss_user_autocomplete(signals);
+}
+
+#[cfg(windows)]
+fn reset_user_autocomplete(mut signals: UserAutocompleteSignals) {
+    invalidate_user_autocomplete(signals);
+    signals.query.set(String::new());
+    signals.results.set(Vec::new());
+    signals.selected.set(None);
+    signals.status.set(String::new());
 }
 
 #[cfg(windows)]
@@ -2580,84 +2796,6 @@ fn load_blocks(
                 if session_generation_current(session_generation, generation)
                     && relationship_load_generation_current(blocks_load_generation, load_generation)
                 {
-                    block_status.set(error);
-                }
-            }
-        }
-    });
-}
-
-#[cfg(windows)]
-fn search_friend_users(
-    session: AuthSession,
-    session_generation: Signal<u64>,
-    query: String,
-    mut friend_search_results: Signal<Vec<UserSummary>>,
-    mut friends_status: Signal<String>,
-) {
-    let query = query.trim().to_string();
-    if query.is_empty() {
-        friend_search_results.set(Vec::new());
-        friends_status.set("Enter a name to search".to_string());
-        return;
-    }
-
-    let generation = *session_generation.read();
-    spawn(async move {
-        if !session_generation_current(session_generation, generation) {
-            return;
-        }
-        friends_status.set(format!("Searching for {query}..."));
-        match search_users_api(&session, &query).await {
-            Ok(users) => {
-                if !session_generation_current(session_generation, generation) {
-                    return;
-                }
-                let count = users.len();
-                friend_search_results.set(users);
-                friends_status.set(format!("Found {count} users"));
-            }
-            Err(error) => {
-                if session_generation_current(session_generation, generation) {
-                    friends_status.set(error);
-                }
-            }
-        }
-    });
-}
-
-#[cfg(windows)]
-fn search_block_report_users(
-    session: AuthSession,
-    session_generation: Signal<u64>,
-    query: String,
-    mut block_search_results: Signal<Vec<UserSummary>>,
-    mut block_status: Signal<String>,
-) {
-    let query = query.trim().to_string();
-    if query.is_empty() {
-        block_search_results.set(Vec::new());
-        block_status.set("Enter a name to search".to_string());
-        return;
-    }
-
-    let generation = *session_generation.read();
-    spawn(async move {
-        if !session_generation_current(session_generation, generation) {
-            return;
-        }
-        block_status.set(format!("Searching for {query}..."));
-        match search_users_api(&session, &query).await {
-            Ok(users) => {
-                if !session_generation_current(session_generation, generation) {
-                    return;
-                }
-                let count = users.len();
-                block_search_results.set(users);
-                block_status.set(format!("Found {count} users"));
-            }
-            Err(error) => {
-                if session_generation_current(session_generation, generation) {
                     block_status.set(error);
                 }
             }
@@ -3848,11 +3986,17 @@ fn restore_composer_after_transport_failure(composer: &mut String, body: &str) -
 }
 
 #[cfg(windows)]
-async fn complete_login(local_dev_account_id: &str) -> Result<AuthSession, String> {
+async fn complete_login(
+    local_dev_account_id: &str,
+    remote_login_provider: RemoteLoginProvider,
+) -> Result<AuthSession, String> {
     if server_origin()?.is_loopback {
         complete_dev_login(local_dev_account_id).await
     } else {
-        complete_steam_login().await
+        match remote_login_provider {
+            RemoteLoginProvider::Steam => complete_steam_login().await,
+            RemoteLoginProvider::Microsoft => complete_microsoft_login().await,
+        }
     }
 }
 
@@ -3943,6 +4087,72 @@ async fn poll_steam_login(poll_token: &str) -> Result<SteamLoginStatus, String> 
         .await
         .map(|response| response.status)
         .map_err(|error| format!("Could not read Steam login polling response: {error}"))
+}
+
+#[cfg(windows)]
+async fn complete_microsoft_login() -> Result<AuthSession, String> {
+    let start = request_microsoft_login().await?;
+    webbrowser::open(&start.browser_url)
+        .map_err(|error| format!("Could not open browser: {error}"))?;
+
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(start.expires_in_seconds.saturating_add(5));
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("Microsoft login expired".to_string());
+        }
+
+        match poll_microsoft_login(&start.poll_token).await? {
+            MicrosoftLoginStatus::Pending => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            MicrosoftLoginStatus::Complete { session } => return Ok(session),
+            MicrosoftLoginStatus::Expired => return Err("Microsoft login expired".to_string()),
+            MicrosoftLoginStatus::Denied { message } => return Err(message),
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn request_microsoft_login() -> Result<MicrosoftLoginStartResponse, String> {
+    let server_url = server_url()?;
+    let response = http_client()?
+        .post(format!("{server_url}/auth/microsoft/device/start"))
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach Agora server: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(api_error(response, "Microsoft login start failed").await);
+    }
+
+    response
+        .json::<MicrosoftLoginStartResponse>()
+        .await
+        .map_err(|error| format!("Could not read Microsoft login response: {error}"))
+}
+
+#[cfg(windows)]
+async fn poll_microsoft_login(poll_token: &str) -> Result<MicrosoftLoginStatus, String> {
+    let server_url = server_url()?;
+    let response = http_client()?
+        .post(format!("{server_url}/auth/microsoft/device/poll"))
+        .json(&MicrosoftLoginPollRequest {
+            poll_token: poll_token.to_string(),
+        })
+        .send()
+        .await
+        .map_err(|error| format!("Could not poll Microsoft login: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(api_error(response, "Microsoft login polling failed").await);
+    }
+
+    response
+        .json::<MicrosoftLoginPollResponse>()
+        .await
+        .map(|response| response.status)
+        .map_err(|error| format!("Could not read Microsoft login polling response: {error}"))
 }
 
 #[cfg(windows)]
@@ -4608,7 +4818,10 @@ fn standalone_local_dev_window_enabled_for(value: Option<&str>, server_url: &str
 }
 
 #[cfg(windows)]
-fn login_start_message(local_dev_account_id: &str) -> String {
+fn login_start_message(
+    local_dev_account_id: &str,
+    remote_login_provider: RemoteLoginProvider,
+) -> String {
     match server_origin() {
         Ok(origin) if origin.is_loopback => {
             format!(
@@ -4616,7 +4829,7 @@ fn login_start_message(local_dev_account_id: &str) -> String {
                 local_dev_account_id.trim()
             )
         }
-        Ok(_) => "Requesting Steam login...".to_string(),
+        Ok(_) => format!("Requesting {} login...", remote_login_provider.label()),
         Err(error) => format!("Cannot sign in: {error}"),
     }
 }
@@ -4826,7 +5039,8 @@ fn chat_mode_overlay_view(
     session: Option<AuthSession>,
     session_generation: Signal<u64>,
     reauth_required: Signal<Option<String>>,
-    local_dev_account_id: Signal<String>,
+    mut local_dev_account_id: Signal<String>,
+    mut remote_login_provider: Signal<RemoteLoginProvider>,
     auth_action_pending: Signal<bool>,
     auth_session: Signal<Option<AuthSession>>,
     login_status: Signal<String>,
@@ -4845,13 +5059,11 @@ fn chat_mode_overlay_view(
     overlay_interactive: Signal<bool>,
     friendships: Signal<Vec<FriendshipSummary>>,
     friendships_load_generation: Signal<u64>,
-    friend_search_query: Signal<String>,
-    friend_search_results: Signal<Vec<UserSummary>>,
+    friend_search: UserAutocompleteSignals,
     friends_status: Signal<String>,
     blocked_users: Signal<Vec<UserSummary>>,
     blocks_load_generation: Signal<u64>,
-    block_search_query: Signal<String>,
-    block_search_results: Signal<Vec<UserSummary>>,
+    block_search: UserAutocompleteSignals,
     block_status: Signal<String>,
     report_reason: Signal<String>,
     report_details: Signal<String>,
@@ -4871,6 +5083,31 @@ fn chat_mode_overlay_view(
         .map(|session| incoming_friend_request_count(&friendships.read(), session.user.id))
         .unwrap_or(0);
     let auth_status_text = login_status.read().clone();
+    let toolbar_session = session.clone();
+    let toolbar_signed_in = toolbar_session.is_some();
+    let toolbar_requires_reauth = reauth_required.read().is_some();
+    let toolbar_auth_action_pending = *auth_action_pending.read();
+    let local_dev_mode = is_local_server_url();
+    let local_dev_account_id_value = local_dev_account_id.read().clone();
+    let sign_in_account_id = local_dev_account_id_value.clone();
+    let remote_login_provider_value = *remote_login_provider.read();
+    let remote_login_provider_selection = remote_login_provider_value.selection_value();
+    let sign_in_provider = remote_login_provider_value;
+    let toolbar_auth_button_disabled = toolbar_auth_action_pending
+        || (!toolbar_signed_in && local_dev_mode && local_dev_account_id_value.trim().is_empty());
+    let toolbar_auth_button_label = if toolbar_signed_in && !toolbar_requires_reauth {
+        "Sign off"
+    } else if toolbar_requires_reauth {
+        "Sign in again"
+    } else {
+        "Sign in"
+    };
+    let local_staff_url = server_url()
+        .ok()
+        .map(|server_url| format!("{server_url}/staff"));
+    let local_access_token = toolbar_session
+        .as_ref()
+        .map(|session| session.access_token.clone());
     let content = match overlay_tab {
         AppTab::DirectMessages => rsx! {
             {direct_messages_panel(
@@ -4888,8 +5125,7 @@ fn chat_mode_overlay_view(
                 session_generation,
                 friendships,
                 friendships_load_generation,
-                friend_search_query,
-                friend_search_results,
+                friend_search,
                 friends_status,
                 direct_messages,
                 active_tab,
@@ -4905,8 +5141,7 @@ fn chat_mode_overlay_view(
                 friends_status,
                 blocked_users,
                 blocks_load_generation,
-                block_search_query,
-                block_search_results,
+                block_search,
                 block_status,
                 report_reason,
                 report_details,
@@ -4920,33 +5155,12 @@ fn chat_mode_overlay_view(
                 session,
                 active_tab,
                 session_generation,
-                reauth_required,
-                local_dev_account_id,
-                auth_action_pending,
-                auth_session,
-                login_status,
                 chat_messages,
-                deleted_message_ids,
                 composer_body,
                 chat_status,
-                presence_counts,
                 presence_selection,
                 chat_outbox,
                 chat_send_pending,
-                updates,
-                direct_messages,
-                friendships,
-                friendships_load_generation,
-                friend_search_query,
-                friend_search_results,
-                friends_status,
-                blocked_users,
-                blocks_load_generation,
-                block_search_query,
-                block_search_results,
-                block_status,
-                report_reason,
-                report_details,
                 report_draft,
                 report_status,
             )}
@@ -4971,7 +5185,7 @@ fn chat_mode_overlay_view(
                 button {
                     class: overlay_tab_class(overlay_tab, AppTab::Global),
                     onclick: move |_| active_tab.set(AppTab::Global),
-                    "Global"
+                    "Global Chat"
                 }
                 button {
                     class: overlay_tab_class(overlay_tab, AppTab::DirectMessages),
@@ -4991,15 +5205,133 @@ fn chat_mode_overlay_view(
                     onclick: move |_| active_tab.set(AppTab::BlockReport),
                     "Block / Report"
                 }
-                div {
-                    class: "auth-status",
-                    role: "status",
-                    aria_live: "polite",
-                    aria_atomic: "true",
-                    "Authentication: {auth_status_text}"
-                }
             }
             section { class: "overlay-content",
+                section { class: "overlay-toolbar", aria_label: "Account toolbar",
+                    div { class: "overlay-toolbar-account",
+                        span { class: "toolbar-auth-status", role: "status", aria_live: "polite", aria_atomic: "true",
+                            "Authentication: {auth_status_text}"
+                        }
+                        if !local_dev_mode {
+                            label { class: "remote-login-provider",
+                                span { "Provider" }
+                                select {
+                                    value: "{remote_login_provider_selection}",
+                                    disabled: toolbar_auth_action_pending || (toolbar_signed_in && !toolbar_requires_reauth),
+                                    aria_label: "Sign-in provider",
+                                    onchange: move |event| {
+                                        if let Some(provider) = RemoteLoginProvider::from_selection_value(&event.value()) {
+                                            remote_login_provider.set(provider);
+                                        }
+                                    },
+                                    option { value: "steam", "Steam" }
+                                    option { value: "microsoft", "Microsoft" }
+                                }
+                            }
+                        }
+                        button {
+                            class: "toolbar-auth-button",
+                            r#type: "button",
+                            disabled: toolbar_auth_button_disabled,
+                            onclick: move |_| {
+                                if let Some(session) = toolbar_session.clone().filter(|_| !toolbar_requires_reauth) {
+                                    sign_out_session(
+                                        session,
+                                        auth_action_pending,
+                                        auth_session,
+                                        session_generation,
+                                        reauth_required,
+                                        login_status,
+                                        chat_messages,
+                                        deleted_message_ids,
+                                        chat_status,
+                                        presence_counts,
+                                        presence_selection,
+                                        chat_outbox,
+                                        chat_send_pending,
+                                        friendships,
+                                        friend_search,
+                                        friends_status,
+                                        blocked_users,
+                                        block_search,
+                                        block_status,
+                                        report_reason,
+                                        report_details,
+                                        report_draft,
+                                        report_status,
+                                        direct_messages,
+                                    );
+                                } else {
+                                    sign_in_session(
+                                        auth_action_pending,
+                                        auth_session,
+                                        session_generation,
+                                        reauth_required,
+                                        sign_in_account_id.clone(),
+                                        sign_in_provider,
+                                        login_status,
+                                        chat_messages,
+                                        deleted_message_ids,
+                                        chat_status,
+                                        presence_counts,
+                                        presence_selection,
+                                        chat_outbox,
+                                        chat_send_pending,
+                                        updates,
+                                        friendships,
+                                        friendships_load_generation,
+                                        friend_search,
+                                        friends_status,
+                                        blocked_users,
+                                        blocks_load_generation,
+                                        block_search,
+                                        block_status,
+                                        report_draft,
+                                        direct_messages,
+                                    );
+                                }
+                            },
+                            "{toolbar_auth_button_label}"
+                        }
+                    }
+                    if local_dev_mode {
+                        div { class: "local-dev-controls",
+                            label { class: "local-dev-account",
+                                span { "Local fixture" }
+                                input {
+                                    value: "{local_dev_account_id_value}",
+                                    disabled: toolbar_signed_in || toolbar_auth_action_pending,
+                                    oninput: move |event| local_dev_account_id.set(event.value())
+                                }
+                            }
+                            if toolbar_signed_in {
+                                span { class: "local-dev-note", "Sign off before switching fixtures." }
+                            } else {
+                                span { class: "local-dev-note", "Roles come from AGORA_DEV_LOGIN_ACCOUNTS." }
+                            }
+                            if let (Some(access_token), Some(local_staff_url)) =
+                                (local_access_token, local_staff_url)
+                            {
+                                div { class: "local-dev-staff",
+                                    input {
+                                        class: "local-dev-token",
+                                        value: "{access_token}",
+                                        readonly: true
+                                    }
+                                    button {
+                                        class: "secondary-button compact",
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            let _ = webbrowser::open(&local_staff_url);
+                                        },
+                                        "Open Staff Console"
+                                    }
+                                }
+                                p { class: "local-dev-note", "Sign in as a configured staff fixture, then paste this token into the console." }
+                            }
+                        }
+                    }
+                }
                 {update_banner(updates)}
                 div { class: "overlay-content-body",
                     {content}
@@ -5015,43 +5347,23 @@ fn overlay_global_chat_panel(
     session: Option<AuthSession>,
     active_tab: Signal<AppTab>,
     session_generation: Signal<u64>,
-    reauth_required: Signal<Option<String>>,
-    mut local_dev_account_id: Signal<String>,
-    auth_action_pending: Signal<bool>,
-    auth_session: Signal<Option<AuthSession>>,
-    login_status: Signal<String>,
     chat_messages: Signal<Vec<ChatMessage>>,
-    deleted_message_ids: Signal<Vec<uuid::Uuid>>,
     mut composer_body: Signal<String>,
     chat_status: Signal<String>,
-    presence_counts: Signal<PresenceCounts>,
     presence_selection: PresenceSelectionSignals,
     chat_outbox: Signal<Option<UnboundedSender<OutgoingChatEvent>>>,
     chat_send_pending: Signal<bool>,
-    updates: UpdateSignals,
-    direct_messages: DirectMessageSignals,
-    friendships: Signal<Vec<FriendshipSummary>>,
-    friendships_load_generation: Signal<u64>,
-    friend_search_query: Signal<String>,
-    friend_search_results: Signal<Vec<UserSummary>>,
-    friends_status: Signal<String>,
-    blocked_users: Signal<Vec<UserSummary>>,
-    blocks_load_generation: Signal<u64>,
-    block_search_query: Signal<String>,
-    block_search_results: Signal<Vec<UserSummary>>,
-    block_status: Signal<String>,
-    report_reason: Signal<String>,
-    report_details: Signal<String>,
     report_draft: Signal<Option<ReportDraft>>,
     report_status: Signal<String>,
 ) -> Element {
+    let mut composer_focus_generation = use_signal(|| 0_u64);
     let chat_status_text = chat_status.read().clone();
     let composer_text = composer_body.read().clone();
     let connected = chat_outbox.read().is_some();
     let signed_in = session.is_some();
-    let requires_reauth = reauth_required.read().is_some();
     let current_user_id = session.as_ref().map(|session| session.user.id);
     let chat_send_pending_value = *chat_send_pending.read();
+    let composer_focus_generation_value = *composer_focus_generation.read();
     let presence_state = *presence_selection.selected.read();
     let presence_value = presence_selection_value(presence_state);
     let presence_status = presence_selection.status.read().clone();
@@ -5063,23 +5375,6 @@ fn overlay_global_chat_panel(
     );
     let can_send =
         signed_in && connected && !chat_send_pending_value && !composer_text.trim().is_empty();
-    let auth_action_pending_value = *auth_action_pending.read();
-    let local_dev_mode = is_local_server_url();
-    let local_dev_account_id_value = local_dev_account_id.read().clone();
-    let sign_in_account_id = local_dev_account_id_value.clone();
-    let auth_button_disabled = auth_action_pending_value
-        || (!signed_in && local_dev_mode && local_dev_account_id_value.trim().is_empty());
-    let auth_button_label = if signed_in && !requires_reauth {
-        "Sign off"
-    } else if requires_reauth {
-        "Sign in again"
-    } else {
-        "Sign in"
-    };
-    let local_staff_url = server_url()
-        .ok()
-        .map(|server_url| format!("{server_url}/staff"));
-    let local_access_token = session.as_ref().map(|session| session.access_token.clone());
     let mut recent_messages = chat_messages
         .read()
         .iter()
@@ -5088,6 +5383,7 @@ fn overlay_global_chat_panel(
         .cloned()
         .collect::<Vec<_>>();
     recent_messages.reverse();
+    let latest_message_id = recent_messages.last().map(|message| message.id);
 
     rsx! {
         div { class: "overlay-global-panel",
@@ -5098,69 +5394,6 @@ fn overlay_global_chat_panel(
                 }
                 div { class: "overlay-panel-actions",
                     span { class: "chat-status-inline", "{chat_status_text}" }
-                    button {
-                        class: "overlay-auth-button",
-                        r#type: "button",
-                        disabled: auth_button_disabled,
-                        onclick: move |_| {
-                            if let Some(session) = session.clone().filter(|_| !requires_reauth) {
-                                sign_out_session(
-                                    session,
-                                    auth_action_pending,
-                                    auth_session,
-                                    session_generation,
-                                    reauth_required,
-                                    login_status,
-                                    chat_messages,
-                                    deleted_message_ids,
-                                    chat_status,
-                                    presence_counts,
-                                    presence_selection,
-                                    chat_outbox,
-                                    chat_send_pending,
-                                    friendships,
-                                    friend_search_query,
-                                    friend_search_results,
-                                    friends_status,
-                                    blocked_users,
-                                    block_search_query,
-                                    block_search_results,
-                                    block_status,
-                                    report_reason,
-                                    report_details,
-                                    report_draft,
-                                    report_status,
-                                    direct_messages,
-                                );
-                            } else {
-                                sign_in_session(
-                                    auth_action_pending,
-                                    auth_session,
-                                    session_generation,
-                                    reauth_required,
-                                    sign_in_account_id.clone(),
-                                    login_status,
-                                    chat_messages,
-                                    deleted_message_ids,
-                                    chat_status,
-                                    presence_counts,
-                                    presence_selection,
-                                    chat_outbox,
-                                    chat_send_pending,
-                                    updates,
-                                    friendships,
-                                    friendships_load_generation,
-                                    friends_status,
-                                    blocked_users,
-                                    blocks_load_generation,
-                                    block_status,
-                                    report_draft,
-                                    direct_messages,
-                                );
-                            }
-                        },
-                        "{auth_button_label}"
-                    }
                 }
                 div { class: "availability-control",
                     label { class: "availability-label",
@@ -5193,43 +5426,6 @@ fn overlay_global_chat_panel(
                         "{presence_status}"
                     }
                 }
-                if local_dev_mode {
-                    div { class: "local-dev-controls",
-                        label { class: "local-dev-account",
-                            span { "Local fixture" }
-                            input {
-                                value: "{local_dev_account_id_value}",
-                                disabled: signed_in || auth_action_pending_value,
-                                oninput: move |event| local_dev_account_id.set(event.value())
-                            }
-                        }
-                        if signed_in {
-                            span { class: "local-dev-note", "Sign off before switching fixtures." }
-                        } else {
-                            span { class: "local-dev-note", "Roles come from AGORA_DEV_LOGIN_ACCOUNTS." }
-                        }
-                        if let (Some(access_token), Some(local_staff_url)) =
-                            (local_access_token, local_staff_url)
-                        {
-                            div { class: "local-dev-staff",
-                                input {
-                                    class: "local-dev-token",
-                                    value: "{access_token}",
-                                    readonly: true
-                                }
-                                button {
-                                    class: "secondary-button compact",
-                                    r#type: "button",
-                                    onclick: move |_| {
-                                        let _ = webbrowser::open(&local_staff_url);
-                                    },
-                                    "Open Staff Console"
-                                }
-                            }
-                            p { class: "local-dev-note", "Sign in as a configured staff fixture, then paste this token into the console." }
-                        }
-                    }
-                }
             }
             div { class: "overlay-message-list",
                 if recent_messages.is_empty() {
@@ -5244,6 +5440,9 @@ fn overlay_global_chat_panel(
                     for message in recent_messages {
                         {global_message_row(message, current_user_id, active_tab, report_draft, report_status)}
                     }
+                    if let Some(latest_message_id) = latest_message_id {
+                        {message_scroll_anchor(format!("global-{latest_message_id}"))}
+                    }
                 }
             }
             form {
@@ -5251,6 +5450,9 @@ fn overlay_global_chat_panel(
                 onsubmit: move |event| {
                     event.prevent_default();
                     if can_send {
+                        composer_focus_generation.set(
+                            composer_focus_generation_value.wrapping_add(1),
+                        );
                         send_pending_global_message(
                             session_generation,
                             composer_body,
@@ -5261,13 +5463,14 @@ fn overlay_global_chat_panel(
                     }
                 },
                 input {
+                    key: "global-composer-{composer_focus_generation_value}",
                     autofocus: true,
                     onmounted: move |event| async move {
                         let _ = event.set_focus(true).await;
                     },
                     placeholder: if signed_in { "Type a global message" } else { "Sign in to chat" },
                     value: "{composer_text}",
-                    disabled: !signed_in || !connected || chat_send_pending_value,
+                    disabled: !signed_in || !connected,
                     oninput: move |event| composer_body.set(event.value())
                 }
                 button {
@@ -5275,6 +5478,20 @@ fn overlay_global_chat_panel(
                     disabled: !can_send,
                     if chat_send_pending_value { "Sending..." } else { "Send" }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn message_scroll_anchor(key: String) -> Element {
+    rsx! {
+        div {
+            key: "{key}",
+            class: "message-scroll-anchor",
+            aria_hidden: "true",
+            onmounted: move |event| async move {
+                let _ = event.scroll_to(ScrollBehavior::Instant).await;
             }
         }
     }
@@ -5400,6 +5617,38 @@ mod relationship_ui_tests {
         assert_eq!(sections.accepted, vec![accepted]);
         assert_eq!(sections.inactive, vec![removed]);
         assert_eq!(incoming_friend_request_count(&friendships, me.id), 1);
+    }
+
+    #[test]
+    fn autocomplete_waits_for_two_non_whitespace_characters() {
+        assert!(!user_autocomplete_query_ready(""));
+        assert!(!user_autocomplete_query_ready("   "));
+        assert!(!user_autocomplete_query_ready(" a "));
+        assert!(user_autocomplete_query_ready(" al "));
+        assert!(user_autocomplete_query_ready("\u{00c5}\u{00df}"));
+    }
+
+    #[test]
+    fn autocomplete_keyboard_navigation_wraps_and_recovers_from_stale_indices() {
+        assert_eq!(next_user_autocomplete_active_index(0, None, true), None);
+        assert_eq!(next_user_autocomplete_active_index(3, None, true), Some(0));
+        assert_eq!(next_user_autocomplete_active_index(3, None, false), Some(2));
+        assert_eq!(
+            next_user_autocomplete_active_index(3, Some(2), true),
+            Some(0)
+        );
+        assert_eq!(
+            next_user_autocomplete_active_index(3, Some(0), false),
+            Some(2)
+        );
+        assert_eq!(
+            next_user_autocomplete_active_index(3, Some(9), true),
+            Some(0)
+        );
+        assert_eq!(
+            next_user_autocomplete_active_index(3, Some(9), false),
+            Some(2)
+        );
     }
 
     #[test]
@@ -5727,6 +5976,147 @@ mod relationship_ui_tests {
 }
 
 #[cfg(windows)]
+fn user_autocomplete_option_id(listbox_id: &str, user: &UserSummary) -> String {
+    format!("{listbox_id}-{}", user.id)
+}
+
+#[cfg(windows)]
+fn user_autocomplete_option(
+    listbox_id: &'static str,
+    index: usize,
+    user: UserSummary,
+    active: bool,
+    signals: UserAutocompleteSignals,
+) -> Element {
+    let option_id = user_autocomplete_option_id(listbox_id, &user);
+    let user_id = user.id.to_string();
+    let display_name = user.display_name.clone();
+
+    rsx! {
+        div {
+            key: "{user_id}",
+            id: "{option_id}",
+            class: if active { "user-autocomplete-option active" } else { "user-autocomplete-option" },
+            role: "option",
+            aria_selected: active,
+            onmousedown: move |event| {
+                event.prevent_default();
+                select_user_autocomplete_option(signals, index);
+            },
+            strong { "{display_name}" }
+            span { "{user_id}" }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn user_autocomplete_combobox(
+    listbox_id: &'static str,
+    label: &'static str,
+    placeholder: &'static str,
+    session: Option<AuthSession>,
+    session_generation: Signal<u64>,
+    signals: UserAutocompleteSignals,
+) -> Element {
+    let query = signals.query.read().clone();
+    let results = signals.results.read().clone();
+    let selected = signals.selected.read().is_some();
+    let pending = *signals.pending.read();
+    let expanded = *signals.expanded.read();
+    let status = signals.status.read().clone();
+    let active_index = (*signals.active_index.read()).filter(|index| *index < results.len());
+    let popup_open = expanded && user_autocomplete_query_ready(&query) && !selected;
+    let active_option_id = active_index
+        .and_then(|index| results.get(index))
+        .map(|user| user_autocomplete_option_id(listbox_id, user))
+        .unwrap_or_default();
+    let input_session = session.clone();
+    let can_search = session.is_some();
+
+    rsx! {
+        div { class: "user-autocomplete",
+            label { class: "sr-only", "{label}" }
+            input {
+                class: "user-autocomplete-input",
+                placeholder: "{placeholder}",
+                value: "{query}",
+                disabled: !can_search,
+                role: "combobox",
+                aria_label: "{label}",
+                aria_autocomplete: "list",
+                aria_controls: "{listbox_id}",
+                aria_expanded: popup_open,
+                aria_activedescendant: "{active_option_id}",
+                aria_busy: pending,
+                autocomplete: "off",
+                onfocus: move |_| show_user_autocomplete(signals),
+                onblur: move |_| dismiss_user_autocomplete(signals),
+                oninput: move |event| {
+                    update_user_autocomplete_query(
+                        input_session.clone(),
+                        session_generation,
+                        signals,
+                        event.value(),
+                    );
+                },
+                onkeydown: move |event| match event.key() {
+                    Key::ArrowDown => {
+                        event.prevent_default();
+                        move_user_autocomplete_active_option(signals, true);
+                    }
+                    Key::ArrowUp => {
+                        event.prevent_default();
+                        move_user_autocomplete_active_option(signals, false);
+                    }
+                    Key::Enter if popup_open => {
+                        event.prevent_default();
+                        if let Some(index) = active_index {
+                            select_user_autocomplete_option(signals, index);
+                        }
+                    }
+                    Key::Escape if popup_open => {
+                        event.prevent_default();
+                        event.stop_propagation();
+                        dismiss_user_autocomplete(signals);
+                    }
+                    _ => {}
+                }
+            }
+            if popup_open {
+                div {
+                    id: "{listbox_id}",
+                    class: "user-autocomplete-menu",
+                    role: "listbox",
+                    if pending {
+                        div { class: "user-autocomplete-empty", "Searching..." }
+                    } else if results.is_empty() {
+                        div { class: "user-autocomplete-empty", "{status}" }
+                    } else {
+                        for (index, user) in results.into_iter().enumerate() {
+                            {user_autocomplete_option(
+                                listbox_id,
+                                index,
+                                user,
+                                active_index == Some(index),
+                                signals,
+                            )}
+                        }
+                    }
+                }
+            } else if !selected && !status.is_empty() {
+                span { class: "user-autocomplete-hint", "{status}" }
+            }
+            span {
+                class: "sr-only",
+                role: "status",
+                aria_live: "polite",
+                "{status}"
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 fn direct_messages_panel(
     session: Option<AuthSession>,
     session_generation: Signal<u64>,
@@ -5735,6 +6125,7 @@ fn direct_messages_panel(
     report_draft: Signal<Option<ReportDraft>>,
     report_status: Signal<String>,
 ) -> Element {
+    let mut composer_focus_generation = use_signal(|| 0_u64);
     let status = signals.status.read().clone();
     let threads = signals.threads.read().clone();
     let selected_thread_id = *signals.selected_thread_id.read();
@@ -5745,14 +6136,14 @@ fn direct_messages_panel(
             .cloned()
     });
     let messages = signals.messages.read().clone();
+    let latest_message_id = messages.last().map(|message| message.id);
     let next_before_message_id = *signals.next_before_message_id.read();
-    let search_query = signals.search_query.read().clone();
-    let search_results = signals.search_results.read().clone();
+    let search_selected_user = signals.search.selected.read().clone();
     let composer_body = signals.composer_body.read().clone();
+    let composer_focus_generation_value = *composer_focus_generation.read();
     let threads_pending = *signals.threads_pending.read();
     let history_pending = *signals.history_pending.read();
     let send_pending = *signals.send_pending.read();
-    let search_pending = *signals.search_pending.read();
     let can_use = session.is_some();
     let can_send = can_use
         && selected_thread_id.is_some()
@@ -5760,7 +6151,6 @@ fn direct_messages_panel(
         && !send_pending;
     let current_user_id = session.as_ref().map(|session| session.user.id);
     let refresh_session = session.clone();
-    let search_session = session.clone();
     let load_older_session = session.clone();
     let refresh_selected_session = session.clone();
     let send_session = session.clone();
@@ -5790,48 +6180,28 @@ fn direct_messages_panel(
                         if threads_pending { "Refreshing..." } else { "Refresh" }
                     }
                 }
-                div { class: "search-row",
-                    label { class: "sr-only", "Search users to start a direct message" }
-                    input {
-                        placeholder: "Search users to message",
-                        value: "{search_query}",
-                        disabled: !can_use || search_pending,
-                        aria_label: "Search users to start a direct message",
-                        oninput: move |event| signals.search_query.set(event.value())
-                    }
-                    button {
-                        r#type: "button",
-                        disabled: !can_use || search_pending,
-                        onclick: move |_| {
-                            if let Some(session) = search_session.clone() {
-                                search_direct_message_users(session, session_generation, signals);
-                            }
-                        },
-                        if search_pending { "Searching..." } else { "Search" }
-                    }
-                }
+                {user_autocomplete_combobox(
+                    "dm-user-suggestions",
+                    "Search users to start a direct message",
+                    "Search users to message",
+                    session.clone(),
+                    session_generation,
+                    signals.search,
+                )}
                 span {
                     class: "panel-status",
                     role: "status",
                     aria_live: "polite",
                     "{status}"
                 }
-            }
-
-            if !search_results.is_empty() {
-                section { class: "relationship-section",
-                    h3 { "Start a Conversation" }
-                    div { class: "relationship-list",
-                        for user in search_results {
-                            {direct_message_search_result_row(
-                                user,
-                                session.clone(),
-                                session_generation,
-                                signals,
-                                active_tab,
-                            )}
-                        }
-                    }
+                if let Some(user) = search_selected_user {
+                    {direct_message_selected_user(
+                        user,
+                        session.clone(),
+                        session_generation,
+                        signals,
+                        active_tab,
+                    )}
                 }
             }
 
@@ -5925,6 +6295,9 @@ fn direct_messages_panel(
                                     report_status,
                                 )}
                             }
+                            if let Some(latest_message_id) = latest_message_id {
+                                {message_scroll_anchor(format!("dm-{latest_message_id}"))}
+                            }
                         }
                     }
 
@@ -5936,6 +6309,9 @@ fn direct_messages_panel(
                                 (send_session.clone(), selected_thread_id)
                             {
                                 if can_send {
+                                    composer_focus_generation.set(
+                                        composer_focus_generation_value.wrapping_add(1),
+                                    );
                                     send_direct_message(
                                         session,
                                         session_generation,
@@ -5947,14 +6323,20 @@ fn direct_messages_panel(
                         },
                         label { class: "sr-only", "Direct message" }
                         input {
+                            key: "dm-composer-{composer_focus_generation_value}",
                             placeholder: if selected_thread.is_some() {
                                 "Type a direct message"
                             } else {
                                 "Select a conversation first"
                             },
                             value: "{composer_body}",
-                            disabled: !can_use || selected_thread.is_none() || send_pending,
+                            disabled: !can_use || selected_thread.is_none(),
                             aria_label: "Direct message",
+                            onmounted: move |event| async move {
+                                if composer_focus_generation_value != 0 {
+                                    let _ = event.set_focus(true).await;
+                                }
+                            },
                             oninput: move |event| signals.composer_body.set(event.value())
                         }
                         button {
@@ -5970,24 +6352,23 @@ fn direct_messages_panel(
 }
 
 #[cfg(windows)]
-fn direct_message_search_result_row(
+fn direct_message_selected_user(
     user: UserSummary,
     session: Option<AuthSession>,
     session_generation: Signal<u64>,
     signals: DirectMessageSignals,
     active_tab: Signal<AppTab>,
 ) -> Element {
-    let user_id = user.id.to_string();
     let display_name = user.display_name.clone();
     let creating = *signals.create_pending.read();
 
     rsx! {
-        article { key: "dm-search-{user_id}", class: "relationship-row",
-            div { class: "relationship-main",
+        div { class: "user-autocomplete-selected",
+            div { class: "user-autocomplete-selected-user",
+                span { "Selected user" }
                 strong { "{display_name}" }
-                span { "{user_id}" }
             }
-            div { class: "relationship-actions",
+            div { class: "user-autocomplete-actions",
                 button {
                     class: "secondary-button compact",
                     r#type: "button",
@@ -6089,15 +6470,13 @@ fn friends_panel(
     session_generation: Signal<u64>,
     friendships: Signal<Vec<FriendshipSummary>>,
     friendships_load_generation: Signal<u64>,
-    mut friend_search_query: Signal<String>,
-    friend_search_results: Signal<Vec<UserSummary>>,
+    friend_search: UserAutocompleteSignals,
     friends_status: Signal<String>,
     direct_messages: DirectMessageSignals,
     active_tab: Signal<AppTab>,
 ) -> Element {
     let status = friends_status.read().clone();
-    let query = friend_search_query.read().clone();
-    let results = friend_search_results.read().clone();
+    let search_selected_user = friend_search.selected.read().clone();
     let friendship_items = friendships.read().clone();
     let can_use = session.is_some();
     let current_user = session.as_ref().map(|session| session.user.clone());
@@ -6117,7 +6496,6 @@ fn friends_panel(
     let incoming_count = incoming.len();
     let outgoing_count = outgoing.len();
     let refresh_session = session.clone();
-    let search_session = session.clone();
 
     rsx! {
         div { class: "relationship-layout",
@@ -6147,42 +6525,26 @@ fn friends_panel(
                     span { class: "friend-stat", strong { "{incoming_count}" } " Incoming" }
                     span { class: "friend-stat", strong { "{outgoing_count}" } " Sent" }
                 }
-                div { class: "search-row",
-                    input {
-                        placeholder: "Search users",
-                        value: "{query}",
-                        disabled: !can_use,
-                        oninput: move |event| friend_search_query.set(event.value())
-                    }
-                    button {
-                        disabled: !can_use,
-                        onclick: move |_| {
-                            if let Some(session) = search_session.clone() {
-                                search_friend_users(
-                                    session,
-                                    session_generation,
-                                    friend_search_query.read().clone(),
-                                    friend_search_results,
-                                    friends_status,
-                                );
-                            }
-                        },
-                        "Search"
-                    }
-                }
+                {user_autocomplete_combobox(
+                    "friend-user-suggestions",
+                    "Search users to add as friends",
+                    "Search users",
+                    session.clone(),
+                    session_generation,
+                    friend_search,
+                )}
                 span { class: "panel-status", "{status}" }
-            }
-
-            section { class: "relationship-section",
-                h3 { "Search Results" }
-                if results.is_empty() {
-                    p { class: "muted-copy", "No user search results yet." }
-                } else {
-                    div { class: "relationship-list",
-                        for user in results {
-                            {friend_search_result_row(user, session.clone(), session_generation, friendships_load_generation, friendships, friends_status, direct_messages, active_tab)}
-                        }
-                    }
+                if let Some(user) = search_selected_user {
+                    {friend_search_selected_user(
+                        user,
+                        session.clone(),
+                        session_generation,
+                        friendships_load_generation,
+                        friendships,
+                        friends_status,
+                        direct_messages,
+                        active_tab,
+                    )}
                 }
             }
 
@@ -6286,7 +6648,7 @@ fn friendship_section(
 
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
-fn friend_search_result_row(
+fn friend_search_selected_user(
     user: UserSummary,
     session: Option<AuthSession>,
     session_generation: Signal<u64>,
@@ -6296,19 +6658,18 @@ fn friend_search_result_row(
     direct_messages: DirectMessageSignals,
     active_tab: Signal<AppTab>,
 ) -> Element {
-    let user_id = user.id.to_string();
     let display_name = user.display_name.clone();
     let message_session = session.clone();
     let message_target = user.clone();
     let message_disabled = session.is_none() || *direct_messages.create_pending.read();
 
     rsx! {
-        article { key: "{user_id}", class: "relationship-row",
-            div { class: "relationship-main",
+        div { class: "user-autocomplete-selected",
+            div { class: "user-autocomplete-selected-user",
+                span { "Selected user" }
                 strong { "{display_name}" }
-                span { "{user_id}" }
             }
-            div { class: "relationship-actions",
+            div { class: "user-autocomplete-actions",
                 button {
                     class: "secondary-button compact",
                     disabled: session.is_none(),
@@ -6479,8 +6840,7 @@ fn block_report_panel(
     friends_status: Signal<String>,
     blocked_users: Signal<Vec<UserSummary>>,
     blocks_load_generation: Signal<u64>,
-    mut block_search_query: Signal<String>,
-    block_search_results: Signal<Vec<UserSummary>>,
+    block_search: UserAutocompleteSignals,
     block_status: Signal<String>,
     mut report_reason: Signal<String>,
     mut report_details: Signal<String>,
@@ -6488,8 +6848,7 @@ fn block_report_panel(
     mut report_status: Signal<String>,
     direct_messages: DirectMessageSignals,
 ) -> Element {
-    let query = block_search_query.read().clone();
-    let results = block_search_results.read().clone();
+    let search_selected_user = block_search.selected.read().clone();
     let blocked = blocked_users.read().clone();
     let block_status_text = block_status.read().clone();
     let reason_text = report_reason.read().clone();
@@ -6515,7 +6874,6 @@ fn block_report_panel(
         .and_then(|draft| draft.message_preview.as_ref())
         .map(|body| report_preview_text(body));
     let refresh_session = session.clone();
-    let search_session = session.clone();
     let submit_session = session.clone();
     let submit_report = selected_report.clone();
     let block_selected_session = session.clone();
@@ -6544,149 +6902,126 @@ fn block_report_panel(
                     }
                 }
                 p { "A block is one-way, but it hides global chat communication in both directions." }
-                div { class: "search-row",
-                    input {
-                        placeholder: "Search users to block or report",
-                        value: "{query}",
-                        disabled: !can_use,
-                        oninput: move |event| block_search_query.set(event.value())
-                    }
-                    button {
-                        disabled: !can_use,
-                        onclick: move |_| {
-                            if let Some(session) = search_session.clone() {
-                                search_block_report_users(
-                                    session,
-                                    session_generation,
-                                    block_search_query.read().clone(),
-                                    block_search_results,
-                                    block_status,
-                                );
-                            }
-                        },
-                        "Search"
-                    }
-                }
+                {user_autocomplete_combobox(
+                    "block-user-suggestions",
+                    "Search users to block or report",
+                    "Search users to block or report",
+                    session.clone(),
+                    session_generation,
+                    block_search,
+                )}
                 span { class: "panel-status", "{block_status_text}" }
+                if let Some(user) = search_selected_user {
+                    {block_report_selected_user(
+                        user,
+                        session.clone(),
+                        session_generation,
+                        chat_messages,
+                        friendships,
+                        friendships_load_generation,
+                        friends_status,
+                        blocked_users,
+                        blocks_load_generation,
+                        block_status,
+                        report_draft,
+                        report_status,
+                        direct_messages,
+                    )}
+                }
             }
 
-            section { class: "relationship-section",
-                h3 { "Report Details" }
-                div { class: "report-target-card",
-                    span { class: "report-target-kind", "{report_kind}" }
-                    strong { "{report_target_name}" }
-                    if !report_target_id.is_empty() {
-                        span { "{report_target_id}" }
+            if selected_report.is_some() {
+                section { class: "relationship-section",
+                    h3 { "Report Details" }
+                    div { class: "report-target-card",
+                        span { class: "report-target-kind", "{report_kind}" }
+                        strong { "{report_target_name}" }
+                        if !report_target_id.is_empty() {
+                            span { "{report_target_id}" }
+                        }
+                        if let Some(preview) = report_preview {
+                            p { class: "report-preview", "\"{preview}\"" }
+                        }
                     }
-                    if let Some(preview) = report_preview {
-                        p { class: "report-preview", "\"{preview}\"" }
-                    }
-                }
-                div { class: "report-fields",
-                    input {
-                        placeholder: "Reason, e.g. harassment or spam",
-                        value: "{reason_text}",
-                        disabled: !can_use,
-                        oninput: move |event| report_reason.set(event.value())
-                    }
-                    textarea {
-                        placeholder: "Optional details",
-                        value: "{details_text}",
-                        disabled: !can_use,
-                        oninput: move |event| report_details.set(event.value())
-                    }
-                }
-                div { class: "report-submit-row",
-                    if let Some(target) = block_selected_target {
-                        button {
-                            class: "secondary-button compact danger",
+                    div { class: "report-fields",
+                        input {
+                            placeholder: "Reason, e.g. harassment or spam",
+                            value: "{reason_text}",
                             disabled: !can_use,
+                            oninput: move |event| report_reason.set(event.value())
+                        }
+                        textarea {
+                            placeholder: "Optional details",
+                            value: "{details_text}",
+                            disabled: !can_use,
+                            oninput: move |event| report_details.set(event.value())
+                        }
+                    }
+                    div { class: "report-submit-row",
+                        if let Some(target) = block_selected_target {
+                            button {
+                                class: "secondary-button compact danger",
+                                disabled: !can_use,
+                                onclick: move |_| {
+                                    if let Some(session) = block_selected_session.clone() {
+                                        block_user_action(
+                                            session,
+                                            session_generation,
+                                            target.clone(),
+                                            chat_messages,
+                                            block_status,
+                                            RelationshipSignals {
+                                                friendships,
+                                                friendships_load_generation,
+                                                friends_status,
+                                                blocked_users,
+                                                blocks_load_generation,
+                                                block_status,
+                                            },
+                                            direct_messages,
+                                        );
+                                    }
+                                },
+                                "Block User"
+                            }
+                        }
+                        button {
+                            class: "secondary-button compact",
+                            disabled: !can_submit_report,
                             onclick: move |_| {
-                                if let Some(session) = block_selected_session.clone() {
-                                    block_user_action(
+                                if let (Some(session), Some(draft)) = (submit_session.clone(), submit_report.clone()) {
+                                    submit_report_action(
                                         session,
                                         session_generation,
-                                        target.clone(),
-                                        chat_messages,
-                                        block_status,
-                                        RelationshipSignals {
-                                            friendships,
-                                            friendships_load_generation,
-                                            friends_status,
-                                            blocked_users,
-                                            blocks_load_generation,
-                                            block_status,
-                                        },
-                                        direct_messages,
+                                        draft,
+                                        report_reason.read().clone(),
+                                        report_details.read().clone(),
+                                        report_status,
+                                        report_draft,
+                                        report_reason,
+                                        report_details,
                                     );
                                 }
                             },
-                            "Block User"
+                            "Submit Report"
+                        }
+                        button {
+                            class: "secondary-button compact",
+                            disabled: selected_report.is_none(),
+                            onclick: move |_| {
+                                report_draft.set(None);
+                                report_status.set("Select a user or message to report".to_string());
+                            },
+                            "Clear"
                         }
                     }
-                    button {
-                        class: "secondary-button compact",
-                        disabled: !can_submit_report,
-                        onclick: move |_| {
-                            if let (Some(session), Some(draft)) = (submit_session.clone(), submit_report.clone()) {
-                                submit_report_action(
-                                    session,
-                                    session_generation,
-                                    draft,
-                                    report_reason.read().clone(),
-                                    report_details.read().clone(),
-                                    report_status,
-                                    report_draft,
-                                    report_reason,
-                                    report_details,
-                                );
-                            }
-                        },
-                        "Submit Report"
-                    }
-                    button {
-                        class: "secondary-button compact",
-                        disabled: selected_report.is_none(),
-                        onclick: move |_| {
-                            report_draft.set(None);
-                            report_status.set("Select a user or message to report".to_string());
-                        },
-                        "Clear"
-                    }
-                }
-                span {
-                    class: "panel-status",
-                    role: "status",
-                    aria_live: "polite",
-                    "{report_status_text}"
                 }
             }
-
-            section { class: "relationship-section",
-                h3 { "Search Results" }
-                if results.is_empty() {
-                    p { class: "muted-copy", "No user search results yet." }
-                } else {
-                    div { class: "relationship-list",
-                        for user in results {
-                            {block_report_user_row(
-                                user,
-                                session.clone(),
-                                session_generation,
-                                chat_messages,
-                                friendships,
-                                friendships_load_generation,
-                                friends_status,
-                                blocked_users,
-                                blocks_load_generation,
-                                block_status,
-                                report_draft,
-                                report_status,
-                                direct_messages,
-                            )}
-                        }
-                    }
-                }
+            span {
+                class: "panel-status",
+                role: "status",
+                aria_live: "polite",
+                "{report_status_text}"
             }
 
             section { class: "relationship-section",
@@ -6707,7 +7042,7 @@ fn block_report_panel(
 
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
-fn block_report_user_row(
+fn block_report_selected_user(
     user: UserSummary,
     session: Option<AuthSession>,
     session_generation: Signal<u64>,
@@ -6722,7 +7057,6 @@ fn block_report_user_row(
     mut report_status: Signal<String>,
     direct_messages: DirectMessageSignals,
 ) -> Element {
-    let user_id = user.id.to_string();
     let display_name = user.display_name.clone();
     let actions_disabled = session.is_none();
     let block_session = session.clone();
@@ -6730,12 +7064,12 @@ fn block_report_user_row(
     let report_target = user.clone();
 
     rsx! {
-        article { key: "{user_id}", class: "relationship-row",
-            div { class: "relationship-main",
+        div { class: "user-autocomplete-selected",
+            div { class: "user-autocomplete-selected-user",
+                span { "Selected user" }
                 strong { "{display_name}" }
-                span { "{user_id}" }
             }
-            div { class: "relationship-actions",
+            div { class: "user-autocomplete-actions",
                 button {
                     class: "secondary-button compact danger",
                     disabled: actions_disabled,
@@ -6910,6 +7244,53 @@ const STYLE: &str = r#"
     --aom-muted: #b2a78f;
 }
 
+* {
+    scrollbar-width: thin;
+    scrollbar-color: var(--aom-frame-mid) #080a0a;
+}
+
+*::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+}
+
+*::-webkit-scrollbar-track {
+    border: 1px solid var(--aom-frame-dark);
+    background: linear-gradient(
+        90deg,
+        #5b421b 0,
+        #5b421b 1px,
+        #080a0a 1px,
+        #080a0a calc(100% - 1px),
+        #5b421b calc(100% - 1px),
+        #5b421b 100%
+    );
+    box-shadow: inset 0 0 0 1px #030404;
+}
+
+*::-webkit-scrollbar-thumb {
+    min-height: 32px;
+    border: 2px solid #080a0a;
+    border-radius: 2px;
+    background: linear-gradient(90deg, #704d1b, #c49845 24%, #f2dea1 50%, #c49845 76%, #704d1b);
+    background-clip: padding-box;
+    box-shadow: inset 0 0 0 1px #f7e5ad;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(90deg, #8a6328, #d8b763 24%, #fff0bf 50%, #d8b763 76%, #8a6328);
+    background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-button {
+    width: 0;
+    height: 0;
+}
+
+*::-webkit-scrollbar-corner {
+    background: #080a0a;
+}
+
 html,
 body {
     margin: 0;
@@ -7032,17 +7413,6 @@ p {
     width: 132px;
 }
 
-.auth-status {
-    padding: 8px 9px;
-    border: 1px solid rgba(236, 212, 139, 0.35);
-    border-radius: 4px;
-    color: var(--aom-muted);
-    background: rgba(8, 10, 10, 0.78);
-    font-size: 11px;
-    line-height: 1.35;
-    overflow-wrap: anywhere;
-}
-
 .overlay-tab {
     display: flex;
     align-items: center;
@@ -7078,7 +7448,7 @@ p {
 
 .overlay-content {
     display: grid;
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
     gap: 10px;
     min-width: 0;
     height: calc(100vh - 28px);
@@ -7094,6 +7464,70 @@ p {
     min-width: 0;
     min-height: 0;
     overflow: hidden;
+}
+
+.overlay-toolbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid rgba(236, 212, 139, 0.35);
+    border-radius: 4px;
+    background: rgba(8, 10, 10, 0.82);
+}
+
+.overlay-toolbar-account {
+    display: flex;
+    flex: 1 1 260px;
+    align-items: center;
+    justify-content: space-between;
+    min-width: 0;
+    gap: 10px;
+}
+
+.toolbar-auth-status {
+    min-width: 0;
+    color: var(--aom-muted);
+    font-size: 11px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+
+.remote-login-provider {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 6px;
+    color: var(--aom-frame-bright);
+    font-size: 11px;
+    font-weight: 800;
+}
+
+.remote-login-provider select {
+    padding: 4px 6px;
+    border: 1px solid var(--aom-frame);
+    border-radius: 3px;
+    color: var(--aom-text);
+    background: #080a0a;
+}
+
+.remote-login-provider {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 6px;
+    color: var(--aom-frame-bright);
+    font-size: 11px;
+    font-weight: 800;
+}
+
+.remote-login-provider select {
+    padding: 4px 6px;
+    border: 1px solid var(--aom-frame);
+    border-radius: 3px;
+    color: var(--aom-text);
+    background: #080a0a;
 }
 
 .update-banner {
@@ -7210,7 +7644,7 @@ p {
     font-size: 10px;
 }
 
-.overlay-auth-button {
+.toolbar-auth-button {
     padding: 5px 9px;
     border: 1px solid var(--aom-frame-bright);
     border-radius: 999px;
@@ -7284,6 +7718,10 @@ p {
     gap: 6px;
 }
 
+.message-scroll-anchor {
+    min-height: 1px;
+}
+
 .overlay-message {
     padding: 8px 10px;
     border: 1px solid #3a2a11;
@@ -7336,6 +7774,12 @@ p {
     border-radius: 4px;
     color: var(--aom-text);
     background: #080a0a;
+}
+
+.overlay-composer input:focus {
+    outline: none;
+    border-color: var(--aom-frame-bright);
+    box-shadow: inset 0 0 0 1px var(--aom-frame-bright);
 }
 
 .overlay-composer button {
@@ -7539,6 +7983,125 @@ p {
     color: #20160a;
     background: var(--aom-frame);
     font-weight: 700;
+}
+
+.user-autocomplete {
+    position: relative;
+    margin-top: 14px;
+}
+
+.user-autocomplete-input {
+    width: 100%;
+    min-width: 0;
+    padding: 12px 13px;
+    border: 1px solid rgba(236, 212, 139, 0.35);
+    border-radius: 6px;
+    color: var(--aom-text);
+    background: #080a0a;
+}
+
+.user-autocomplete-input:focus {
+    outline: none;
+    border-color: var(--aom-frame-bright);
+    box-shadow: inset 0 0 0 1px var(--aom-frame-bright);
+}
+
+.user-autocomplete-hint {
+    display: block;
+    margin-top: 6px;
+    color: var(--aom-muted);
+    font-size: 11px;
+}
+
+.user-autocomplete-menu {
+    position: absolute;
+    z-index: 4;
+    top: calc(100% + 4px);
+    right: 0;
+    left: 0;
+    max-height: 220px;
+    overflow-y: auto;
+    border: 1px solid var(--aom-frame);
+    border-radius: 5px;
+    background: linear-gradient(180deg, #1a1d1b, #080a0a);
+    box-shadow: inset 0 0 0 1px var(--aom-frame-dark), 0 10px 24px rgba(0, 0, 0, 0.42);
+}
+
+.user-autocomplete-option,
+.user-autocomplete-empty {
+    min-width: 0;
+    padding: 9px 11px;
+}
+
+.user-autocomplete-option {
+    display: grid;
+    gap: 2px;
+    border-bottom: 1px solid rgba(236, 212, 139, 0.13);
+    cursor: pointer;
+}
+
+.user-autocomplete-option:last-child {
+    border-bottom: 0;
+}
+
+.user-autocomplete-option:hover,
+.user-autocomplete-option.active {
+    background: rgba(165, 121, 50, 0.25);
+    box-shadow: inset 3px 0 0 var(--aom-frame-bright);
+}
+
+.user-autocomplete-option strong {
+    overflow: hidden;
+    color: #fff8ed;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.user-autocomplete-option span,
+.user-autocomplete-empty {
+    overflow: hidden;
+    color: var(--aom-muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+}
+
+.user-autocomplete-selected {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 10px;
+    padding: 10px 11px;
+    border: 1px solid rgba(236, 212, 139, 0.28);
+    border-radius: 6px;
+    background: #080a0a;
+}
+
+.user-autocomplete-selected-user {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+}
+
+.user-autocomplete-selected-user span {
+    color: var(--aom-muted);
+    font-size: 10px;
+    text-transform: uppercase;
+}
+
+.user-autocomplete-selected-user strong {
+    overflow: hidden;
+    color: var(--aom-frame-bright);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.user-autocomplete-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
 }
 
 .panel-status,
@@ -7795,8 +8358,22 @@ select:disabled {
         justify-content: flex-start;
     }
 
+    .overlay-toolbar-account {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
     .relationship-actions {
         flex-wrap: wrap;
+    }
+
+    .user-autocomplete-selected {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .user-autocomplete-actions {
+        justify-content: flex-start;
     }
 
     .direct-message-layout {
