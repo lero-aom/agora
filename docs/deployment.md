@@ -1,10 +1,12 @@
 # Production Deployment
 
+For the complete service-specific procedure, start with the [Agora production runbook](production-runbook.md). This document remains the focused Compose and infrastructure reference.
+
 This runbook deploys the Compose stack in `docker-compose.prod.yml`: Caddy is the only public service, the Agora server is reachable only through Caddy, and PostgreSQL has no host port. The separate development Compose file binds PostgreSQL only to `127.0.0.1` for host-side integration tests.
 
 ## Prerequisites
 
-- An x86_64 (amd64) Linux host with Docker Engine, Docker Compose v2, and PowerShell 7 for the maintenance scripts. Production Compose explicitly requests `linux/amd64` for every service; ARM64 deployment is unsupported.
+- An x86_64 (amd64) Linux host with Docker Engine and Docker Compose v2. PowerShell 7 is needed on the host only when using the repository's optional backup and restore scripts. Production Compose explicitly requests `linux/amd64` for every service; ARM64 deployment is unsupported.
 - A DNS A/AAAA record for the production hostname pointing to the host.
 - Firewall rules allowing only SSH administration and TCP 80/443. Do not publish TCP 5432 or the server's port 8080.
 - A protected `.env` file based on `.env.production.example`, for example with mode `600` on Linux.
@@ -16,7 +18,7 @@ Set `AGORA_SITE_ADDRESS` to a public DNS hostname and `AGORA_PUBLIC_URL` to its 
 Microsoft sign-in is optional and accepts personal Microsoft accounts only. It uses Microsoft's `consumers` authority, creates a separate Agora identity from any Steam identity, and does not verify Xbox, Microsoft Store, or Game Pass ownership.
 
 1. In Microsoft Entra admin center, register an application for **Personal Microsoft accounts only**.
-2. Add a **Web** platform redirect URI matching `AGORA_PUBLIC_URL` exactly with `/auth/microsoft/callback` appended, such as `https://chat.example.com/auth/microsoft/callback`.
+2. Add a **Web** platform redirect URI matching `AGORA_PUBLIC_URL` exactly with `/auth/microsoft/callback` appended: `https://chat.aomagora.com/auth/microsoft/callback`.
 3. Create a client secret and retain its **Value**. The secret value is shown only once.
 4. Set both values in the protected production `.env` file:
 
@@ -69,7 +71,7 @@ docker compose --env-file .env -f docker-compose.prod.yml ps
 6. Verify the public endpoint from outside the host:
 
 ```powershell
-curl.exe --fail --retry 12 https://chat.example.com/health
+curl.exe --fail --retry 12 https://chat.aomagora.com/health
 ```
 
 The server runs as UID/GID `10001`, has a read-only root filesystem and only a small writable `/tmp`, and drops Linux capabilities. Caddy-to-server and server-to-PostgreSQL traffic use separate internal networks, so Caddy cannot reach PostgreSQL directly. The server also has a separate egress network because Steam OpenID, the Steam Web API, and Microsoft OpenID Connect require outbound access. Caddy retains only the bind capability needed for ports 80/443, and its writable certificate/config paths are named volumes.

@@ -1,5 +1,7 @@
 # Operations Runbook
 
+For the full release, deployment, and normal-player workflow, see the [Agora production runbook](production-runbook.md). This document covers focused backup, restore, and incident procedures.
+
 ## Routine checks
 
 Use the production Compose file and protected `.env` file for every command:
@@ -47,7 +49,7 @@ pwsh -NoProfile -File scripts/restore-postgres.ps1 -EnvFile .env -Backup /srv/ag
 
 ```powershell
 docker compose --env-file .env -f docker-compose.prod.yml up -d --wait server proxy
-curl.exe --fail --retry 12 https://chat.example.com/health
+curl.exe --fail --retry 12 https://chat.aomagora.com/health
 ```
 
 5. Check logs, login, and a representative WebSocket connection before reopening normal operations.

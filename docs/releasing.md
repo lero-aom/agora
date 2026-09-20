@@ -1,5 +1,7 @@
 # Releasing Agora
 
+For the service-specific workflow, signing-key explanation, GitHub Release publishing, and VPS handoff, see the [Agora production runbook](production-runbook.md). This document remains the detailed release-script reference.
+
 Release and image-publish scripts only operate from a clean Git worktree, including no untracked files. This ties the build, source archive, image labels, and release notes to one reviewed commit.
 
 ## Client archive
@@ -7,7 +9,7 @@ Release and image-publish scripts only operate from a clean Git worktree, includ
 Run the complete release check from a Windows environment with a PostgreSQL test database configured in `DATABASE_URL`. Load `AGORA_UPDATE_SIGNING_KEY_B64` into that process from the release secret store before running the script. It is a Base64-encoded 32-byte Ed25519 seed, is never accepted as a command-line argument, and must not be echoed or logged. The script removes it from the process environment except while invoking the signer:
 
 ```powershell
-pwsh -NoProfile -File scripts/release.ps1 -ServerUrl https://chat.example.com
+pwsh -NoProfile -File scripts/release.ps1 -ServerUrl https://chat.aomagora.com
 ```
 
 The script fixes `SOURCE_DATE_EPOCH` to the commit timestamp, uses `Cargo.lock`, checks formatting, Clippy, unit tests, all PostgreSQL feature and invariant tests, and release builds. It derives the public key with the release-only `agora-update-sign` binary, embeds that key and `UpdateBaseUrl` into the Windows client, then creates these artifacts under `dist`:

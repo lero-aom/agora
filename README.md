@@ -41,7 +41,7 @@ Microsoft app registration, redirect URI, and credential configuration are docum
 
 ## Deployment and Operations
 
-Production deployment, image-digest pinning, TLS, and update procedures are documented in [docs/deployment.md](docs/deployment.md). Database backup, restore, and incident procedures are in [docs/operations.md](docs/operations.md). Release packaging and server-image publishing are covered by [docs/releasing.md](docs/releasing.md).
+Start with the end-to-end [production runbook](docs/production-runbook.md) for release signing, GitHub Releases, `/opt/agora` deployment, normal-player testing, maintenance, and recovery. Focused references remain available for [deployment](docs/deployment.md), [operations](docs/operations.md), and [releasing](docs/releasing.md).
 
 ## Windows Updates
 
