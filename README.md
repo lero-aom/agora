@@ -1,54 +1,43 @@
-# Agora
+<p align="center">
+  <img src="assets/logo/logo.png" alt="Agora logo" width="112">
+</p>
 
-## Local Fixture Mode
+<h1 align="center">Agora</h1>
 
-Local Docker development enables fake identities instead of remote Steam or Microsoft login. The server only permits this mode when `AGORA_PUBLIC_URL` is loopback, and the development Compose ports bind to `127.0.0.1`.
+<p align="center">Unofficial Windows companion chat for Age of Mythology: Retold.</p>
 
-Start the local stack with:
+<p align="center">
+  <a href="https://github.com/lero-aom/agora/releases/latest">Download</a>
+  | <a href="docs/trust-and-privacy.md">Trust and privacy</a>
+  | <a href="CONTRIBUTING.md">Contribute</a>
+  | <a href="SECURITY.md">Security</a>
+</p>
 
-```powershell
-docker compose --env-file .env.example up --build
-```
+[![CI](https://github.com/lero-aom/agora/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lero-aom/agora/actions/workflows/ci.yml)
 
-The example file is deliberately local-only and uses disposable development secrets. An `.env` file with equivalent local values can replace the `--env-file` option for a long-lived local instance.
+Agora provides global chat, direct messages, friends, blocking, reporting, moderation tools, and a Windows overlay designed for Age of Mythology: Retold players. The client can also run as a normal desktop window for local development.
 
-`.env.example` configures these fixture accounts through `AGORA_DEV_LOGIN_ACCOUNTS`:
+Agora is an independent community project. It is not affiliated with or endorsed by the Age of Mythology rights holders.
 
-- `alice`, `bob`, `reporter`, and `target` are regular users.
-- `moderator` can review reports, delete messages, and suspend regular users.
-- `admin` can also ban and unban users.
-- `owner` can act on admins as well as lower roles.
+## Download
 
-The Windows client shows a **Local fixture** field whenever its server URL is `localhost`, `127.0.0.1`, or `::1`. Enter an account ID, sign in, perform an action, sign off, and sign in as the next fixture. Local sessions stay in memory, so a restart always begins unsigned in. Set `AGORA_DEV_ACCOUNT_ID` before starting the client to choose its initial fixture instead of `alice`.
+Download the latest Windows release from [GitHub Releases](https://github.com/lero-aom/agora/releases/latest). Release archives include the executable, checksums, license, source notice, and matching source archive.
 
-Set `AGORA_LOCAL_DEV_WINDOW=true` before starting `agora-client.exe` to open the same UI as a normal standalone 900x560 desktop window. This mode only activates for loopback server URLs, does not need AoM to be running, and disables tray, game-watcher, and `Ctrl+Enter` overlay behavior.
+The first updater-capable version must be installed manually. Later releases verify a signed update manifest and the downloaded executable before replacing the installed client. See [releasing](docs/releasing.md) for the maintainer-side release process.
 
-For moderation tests, sign in as `moderator`, `admin`, or `owner`. The Local fixture section exposes the current access token and opens the existing staff console at `http://localhost/staff`; paste the token into that console.
+## Safety Boundary
 
-Example workflow:
+Agora is an external companion application. To locate the game, it enumerates visible top-level windows and checks candidate window titles and process image paths. Once it identifies Age of Mythology: Retold, it uses the matched window's bounds, focus, and minimized state for overlay placement. It does not read or write game memory, inject code, bypass anti-cheat, automate input, or inspect game state.
 
-1. Sign in as `alice` and send a friend request or global message.
-2. Sign in as `bob` to accept, block, or report it.
-3. Sign in as a staff fixture to review the report and exercise the permitted moderation actions.
+The complete source-backed explanation covers game integration, local fixtures, account sessions, moderation privacy, updates, and stored data categories in [Trust and Privacy](docs/trust-and-privacy.md).
 
-Do not enable local fixture mode or copy its fixture configuration to a public deployment.
+## Project Documentation
 
-## Remote Sign-In
+- [Development](docs/development.md) explains the local Docker fixture environment and validation commands.
+- [Reference deployment](docs/deployment.md) explains the reviewed production configuration and its security invariants.
+- [Releasing](docs/releasing.md) explains signed Windows packages and server image publication.
+- [Security policy](SECURITY.md) explains private vulnerability reporting.
 
-Public servers offer Steam and, when configured, Microsoft personal-account sign-in from the client toolbar. Microsoft identities are separate Agora accounts from Steam identities, even when the same person controls both. Agora does not link those accounts or verify Xbox, Microsoft Store, or Game Pass ownership.
+## License
 
-Microsoft app registration, redirect URI, and credential configuration are documented in [docs/deployment.md](docs/deployment.md).
-
-## Deployment and Operations
-
-Start with the end-to-end [production runbook](docs/production-runbook.md) for release signing, GitHub Releases, `/opt/agora` deployment, normal-player testing, maintenance, and recovery. Focused references remain available for [deployment](docs/deployment.md), [operations](docs/operations.md), and [releasing](docs/releasing.md).
-
-## Windows Updates
-
-Official Windows builds embed an HTTPS update base URL and an Ed25519 public key at compile time. They never use `AGORA_SERVER_URL` to discover update metadata. On startup, non-local clients verify the detached signature over the raw manifest before parsing it, then verify the streamed executable SHA-256 and size before replacing themselves. Loopback development servers skip update checks.
-
-The first updater-capable build must be installed manually from a release. Later builds show an accessible update banner with retry and manual-release actions; selecting **Update and restart** stages the verified executable beside Agora and uses a copied helper to atomically replace it after exit. If staging or replacement cannot complete, the current executable and recovery backup remain available and the release page is the safe fallback.
-
-## License and Source
-
-Agora is licensed under [AGPL-3.0-only](LICENSE). Every Windows release archive includes the license, a source notice with the exact commit, and a complete matching source archive. Operators running modified network versions must make the corresponding source available to their users as required by AGPLv3 section 13.
+Agora is licensed under [AGPL-3.0-only](LICENSE). Network operators running modified versions must make the corresponding source available to their users as required by AGPLv3 section 13.
