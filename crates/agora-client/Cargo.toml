@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
 agora-common.workspace = true
 base64.workspace = true
 dioxus.workspace = true
