@@ -15,12 +15,4 @@ Changes to Docker, Compose, Caddy, release scripts, or deployment documentation 
 
 ## Changes and Reviews
 
-Describe user-visible behavior, security implications, and validation performed in the pull request. Keep migrations, server behavior, and client protocol changes separately reviewable when practical. Update the relevant deployment or release documentation when a configuration variable, backup procedure, image, or release artifact changes.
-
-## Releases
-
-`scripts/release.ps1` and `scripts/publish-server-image.ps1` refuse a dirty Git worktree, including untracked files. Commit the exact reviewed revision first. See [docs/releasing.md](docs/releasing.md) for the complete release process.
-
-## Security Reports
-
-Do not file suspected vulnerabilities as public issues. Follow [SECURITY.md](SECURITY.md) instead.
+Describe user-visible behavior, security implications, and validation performed in the pull request. Keep migrations, server behavior, and client protocol changes separately reviewable when practical.
